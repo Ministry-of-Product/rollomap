@@ -13,6 +13,7 @@
     "dev:api": "npm --workspace @rollomap/api run dev",
     "dev:webapp": "npm --workspace @rollomap/webapp run dev",
     "dev:mcp": "npm --workspace @rollomap/mcp-server run dev",
+    "mcp:launch": "scripts/launch-mcp.sh",
     "seed": "npm --workspace @rollomap/api run seed",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"

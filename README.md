@@ -89,7 +89,21 @@ this to your MCP client config (e.g. Claude Desktop's
 You can also run it directly to verify it boots:
 
 ```bash
-npm run dev:mcp
+scripts/launch-mcp.sh
+```
+
+The launcher reads `.env` if present, falls back to the local Postgres defaults,
+and keeps stdout reserved for the MCP protocol. For MCP client config, prefer
+calling the script directly:
+
+```json
+{
+  "mcpServers": {
+    "rollomap": {
+      "command": "/absolute/path/to/rollomap/scripts/launch-mcp.sh"
+    }
+  }
+}
 ```
 
 ### Tools exposed
