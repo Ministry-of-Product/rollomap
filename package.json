@@ -1,0 +1,23 @@
+{
+  "name": "rollomap",
+  "private": true,
+  "version": "0.1.0",
+  "description": "RolloMap - private relationship intelligence (local v1)",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d postgres",
+    "dev:api": "npm --workspace @rollomap/api run dev",
+    "dev:webapp": "npm --workspace @rollomap/webapp run dev",
+    "dev:mcp": "npm --workspace @rollomap/mcp-server run dev",
+    "seed": "npm --workspace @rollomap/api run seed",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
