@@ -398,14 +398,27 @@ server.tool(
   },
   async ({ interaction_type, title, summary, body, occurred_at, participant_ids, topics }) => {
     const client = await pool.connect();
+    const topicNames = Array.from(new Set(topics.map(t => t.trim()).filter(Boolean)));
     try {
       await client.query('BEGIN');
       const ix = await client.query(
         `INSERT INTO interaction (workspace_id, interaction_type, title, summary, body, occurred_at, topics)
          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb) RETURNING *`,
-        [WORKSPACE_ID, interaction_type, title ?? null, summary ?? null, body ?? null, occurred_at, JSON.stringify(topics)],
+        [WORKSPACE_ID, interaction_type, title ?? null, summary ?? null, body ?? null, occurred_at, JSON.stringify(topicNames)],
       );
       const interaction = ix.rows[0];
+      const topicIds: string[] = [];
+      for (const topicName of topicNames) {
+        const topic = await client.query<{ id: string }>(
+          `INSERT INTO topic (workspace_id, name, created_by)
+           VALUES ($1, $2, 'agent')
+           ON CONFLICT (workspace_id, lower(name)) DO UPDATE SET
+             name = topic.name
+           RETURNING id`,
+          [WORKSPACE_ID, topicName],
+        );
+        topicIds.push(topic.rows[0]!.id);
+      }
       for (const pid of participant_ids) {
         await client.query(
           `INSERT INTO interaction_participant (workspace_id, interaction_id, person_id)
@@ -419,9 +432,24 @@ server.tool(
            WHERE workspace_id = $1 AND id = $3`,
           [WORKSPACE_ID, occurred_at, pid],
         );
+        for (const topicId of topicIds) {
+          await client.query(
+            `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed)
+             VALUES ($1, $2, $3, 0.7, 1, $4::timestamptz, false)
+             ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE SET
+               confidence = GREATEST(person_topic.confidence, EXCLUDED.confidence),
+               evidence_count = person_topic.evidence_count + 1,
+               last_evidence_at = GREATEST(
+                 coalesce(person_topic.last_evidence_at, EXCLUDED.last_evidence_at),
+                 EXCLUDED.last_evidence_at
+               ),
+               updated_at = now()`,
+            [WORKSPACE_ID, pid, topicId, occurred_at],
+          );
+        }
       }
       await client.query('COMMIT');
-      return ok({ interaction });
+      return ok({ interaction, linked_topics: topicNames });
     } catch (err) {
       await client.query('ROLLBACK');
       throw err;
