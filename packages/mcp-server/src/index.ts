@@ -13,6 +13,48 @@ const ok = (data: unknown) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
 });
 
+// ------- create_person -------
+server.tool(
+  'create_person',
+  'Create a new person in the user\'s relationship memory.',
+  {
+    display_name: z.string().min(1),
+    primary_email: z.string().email().nullable().optional(),
+    company: z.string().nullable().optional(),
+    title: z.string().nullable().optional(),
+    linkedin_url: z.string().url().nullable().optional(),
+    summary: z.string().nullable().optional(),
+    how_known: z.string().nullable().optional(),
+    aliases: z.array(z.string()).optional(),
+    known_emails: z.array(z.string()).optional(),
+    known_phones: z.array(z.string()).optional(),
+    user_pinned: z.boolean().optional(),
+  },
+  async (data) => {
+    const result = await query(
+      `INSERT INTO person (workspace_id, display_name, primary_email, company, title, linkedin_url, summary, how_known, aliases, known_emails, known_phones, user_pinned)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
+       RETURNING *`,
+      [
+        WORKSPACE_ID,
+        data.display_name,
+        data.primary_email ?? null,
+        data.company ?? null,
+        data.title ?? null,
+        data.linkedin_url ?? null,
+        data.summary ?? null,
+        data.how_known ?? null,
+        JSON.stringify(data.aliases ?? []),
+        JSON.stringify(data.known_emails ?? []),
+        JSON.stringify(data.known_phones ?? []),
+        data.user_pinned ?? false,
+      ],
+    );
+
+    return ok({ person: result.rows[0] });
+  },
+);
+
 // ------- search_people -------
 server.tool(
   'search_people',
