@@ -23,7 +23,8 @@ The skill halts loudly rather than guessing. It will stop and ask before proceed
 - the API at `http://localhost:4000` is not reachable;
 - the inbox is empty;
 - you point it at a path outside `ingest/inbox/`;
-- the file extension is not in `{.md, .txt, .csv, .tsv, .vcf, .json, .eml, .mbox}` (PDFs and Office docs are deliberately excluded — adding them is a conscious decision, not an implicit one);
+- the file extension is not in `{.md, .txt, .csv, .tsv, .vcf, .json, .eml, .mbox, .pdf}` (Office docs and media files are deliberately excluded — adding them is a conscious decision, not an implicit one);
+- a `.pdf` is scanned / image-only (no extractable text) — OCR is not wired in;
 - a `.txt` / `.md` file contains > 5 % non-printable bytes (binary masquerading as text);
 - after image-stripping the cleaned text is still > 2 MB (too large for in-context extraction);
 - the content does not look like contact / relationship data (source code, transactions, journals, medical records, etc.);
@@ -44,6 +45,7 @@ In each of those cases the skill will tell you exactly which rule fired and wait
 | vCard | `.vcf` | Person + known emails / phones / org / title |
 | Email export / mbox | `.eml`, `.mbox` | Interaction (type=email) with sender + recipients as participants |
 | RolloMap-shaped JSON | `.json` | Validated then forwarded to the API |
+| Born-digital PDF (text extractable) | `.pdf` | Text extracted via poppler `pdftotext`, then routed through the markdown/text path. Scanned PDFs are refused. |
 
 For freeform formats Claude prefers fewer high-confidence creates over many low-confidence ones — single first-name mentions without a distinguishing signal are skipped and listed in the log under `skipped: [{reason: "ambiguous_first_name", ...}]` rather than guessed at.
 

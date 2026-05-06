@@ -14,8 +14,8 @@ These are the "exception" cases. When any of these triggers, stop, tell the user
 1. **API unreachable.** Run `curl -s -m 5 http://localhost:4000/health`. If it does not return `{"status":"ok"}`, stop with: `API at http://localhost:4000 is not responding. Start the rollomap API before re-running.`
 2. **Inbox empty.** If `ingest/inbox/` contains no files (other than `.gitkeep`), stop with: `ingest/inbox/ is empty — nothing to ingest.`
 3. **File outside inbox.** If the user names a path that is not under `ingest/inbox/`, stop with: `<path> is outside ingest/inbox/. Move it into the inbox first.` Do not read it.
-4. **Unsupported format.** Supported extensions: `.md`, `.txt`, `.csv`, `.tsv`, `.vcf`, `.json`, `.eml`, `.mbox`. Anything else (`.mp3`, `.mp4`, `.mov`, `.wav`, `.zip`, `.exe`, `.dmg`, `.pkg`, `.docx`, `.xlsx`, `.pptx`, `.pdf`, image formats other than already-extracted text, etc.) → stop with: `Unsupported format <ext>. This skill processes text-based contact / interaction sources. To handle <ext>, add a preprocessor under .claude/skills/ingest/scripts/ and a dispatch branch in SKILL.md.`
-   - Specifically refuse `.pdf` here. Adding PDF support is a deliberate decision (do you OCR? text-extract? both?) and should not be done implicitly.
+4. **Unsupported format.** Supported extensions: `.md`, `.txt`, `.csv`, `.tsv`, `.vcf`, `.json`, `.eml`, `.mbox`, `.pdf` (born-digital only — see rule 4a). Anything else (`.mp3`, `.mp4`, `.mov`, `.wav`, `.zip`, `.exe`, `.dmg`, `.pkg`, `.docx`, `.xlsx`, `.pptx`, image formats other than already-extracted text, etc.) → stop with: `Unsupported format <ext>. This skill processes text-based contact / interaction sources. To handle <ext>, add a preprocessor under .claude/skills/ingest/scripts/ and a dispatch branch in SKILL.md.`
+4a. **Scanned / image-only PDF.** If `pdf-to-text.py` exits non-zero with the "scanned" message (extracted text < 200 chars), stop with: `<file> is a scanned/image-only PDF. OCR is not implemented in this skill. Add ocrmypdf or similar under .claude/skills/ingest/scripts/ before re-running.`
 5. **Binary content masquerading as text.** If a `.txt` or `.md` file contains > 5% non-printable bytes (after stripping known data-URIs), stop with: `<file> appears to be binary. Aborting — manual review needed.`
 6. **Oversize after preprocessing.** After running `strip-images.py`, if the cleaned text is still > 2,000,000 characters (~2 MB), stop with: `<file> is still <size> chars after image stripping. Too large for in-context extraction. Pre-split the file or write a structured parser.`
 7. **Out-of-scope content.** If the file is clearly *not* contact / relationship data — source code, financial transactions, system logs, personal journal entries, medical records — stop with: `<file> does not look like contact / relationship data. This skill does not ingest <what-you-saw>. If this is intentional, tell me what you want extracted.`
@@ -40,6 +40,7 @@ These are the "exception" cases. When any of these triggers, stop, tell the user
 | `.vcf` | Parse vCard with stdlib (each `BEGIN:VCARD ... END:VCARD` block = one person). Map FN→display_name, EMAIL→primary_email/known_emails, TEL→known_phones, ORG→company, TITLE→title, URL containing "linkedin.com"→linkedin_url. Run dedupe before POST. |
 | `.eml`, `.mbox` | Parse with stdlib `email`. For each message: create one `interaction` (type=email), participants = sender + To + Cc resolved against existing people; create new people for unrecognized addresses. Subject→title, plaintext body→body. |
 | `.json` | If shape is `[{display_name, ...}, ...]` matching the `POST /api/people` schema, validate and forward. Otherwise stop and ask for a column mapping. |
+| `.pdf` | (a) Run `pdf-to-text.py <pdf> --out <tmp>.txt` to extract plain text. The helper exits non-zero on scanned PDFs — let that bubble up to STOP rule 4a. (b) Then take the `.md`/`.txt` path on the extracted file. Try `--layout` if the default extraction is jumbled (e.g. multi-column resumes / decks). Always preserve the original PDF in `processed/<date>/` next to the extracted `.txt` — both go into the archive. |
 
 ### 3. Match → write
 - Use `merge-csv.py` for tabular sources — it dedupes by email → exact name → fuzzy first+last-token, and PATCHes vs POSTs accordingly.
@@ -67,6 +68,7 @@ One short message to the user:
 In `.claude/skills/ingest/scripts/`:
 
 - `strip-images.py <input> [--out PATH]` — removes base64 data URIs and >500-char base64 blobs.
+- `pdf-to-text.py <input.pdf> [--out PATH] [--layout]` — extracts text via `pdftotext` (poppler); exits non-zero on scanned PDFs.
 - `merge-csv.py <csv> --first-col ... --last-col ... --email-col ... [--secondary-email-col ...] [--linkedin-col ...] [--org-col ...] [--phone-col ...] [--summary-cols A B C] [--how-known TEXT] [--source-label TEXT] [--skip-email EMAIL] [--skip-name NAME] [--api URL] [--log PATH] [--dry-run]` — dedupe-aware CSV merger.
 - `suggest-merges.py [--api URL] [--out PATH]` — finds near-duplicate person records by 4 heuristics: first+last-prefix, exact display_name, deaccented display_name, shared email.
 
