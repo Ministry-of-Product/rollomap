@@ -36,7 +36,7 @@ These are the "exception" cases. When any of these triggers, stop, tell the user
 | Extension | Approach |
 |---|---|
 | `.csv`, `.tsv` | Inspect header. If schema is recognized (Wild Apricot members, LinkedIn connections, Google Contacts), use `merge-csv.py` with the appropriate column-mapping flags (see `csv-recipes.md` if present, otherwise figure out the mapping from the header and document it inline). For unknown schemas, ask the user for the column mapping before running. |
-| `.md`, `.txt` | (a) Run `strip-images.py` to remove embedded base64. (b) Read the cleaned text. (c) Extract people / meeting events / topics / commitments using the LLM. (d) For each extracted person, dedupe by name+context against existing DB (`GET /api/people?q=<name>`) before POST. (e) For meeting events, create `interaction` rows linking participants. |
+| `.md`, `.txt` | (a) Run `strip-images.py` to remove embedded base64. (b) Read the cleaned text. (c) Extract people / meeting events / topics / commitments using the LLM. (d) For each extracted person, dedupe by name+context against existing DB (`GET /api/people?q=<name>`) before POST. (e) For meeting events, create `interaction` rows linking participants. (f) If the source is journal-style with `<Date>: <Name>` section headers, prefer `extract-dated-interactions.py` over hand-rolled extraction — it handles dated headers, multi-attendee splits (`+`, `,`), TOC dot-leader detection, and stub-creation for unknown attendees. |
 | `.vcf` | Parse vCard with stdlib (each `BEGIN:VCARD ... END:VCARD` block = one person). Map FN→display_name, EMAIL→primary_email/known_emails, TEL→known_phones, ORG→company, TITLE→title, URL containing "linkedin.com"→linkedin_url. Run dedupe before POST. |
 | `.eml`, `.mbox` | Parse with stdlib `email`. For each message: create one `interaction` (type=email), participants = sender + To + Cc resolved against existing people; create new people for unrecognized addresses. Subject→title, plaintext body→body. |
 | `.json` | If shape is `[{display_name, ...}, ...]` matching the `POST /api/people` schema, validate and forward. Otherwise stop and ask for a column mapping. |
@@ -69,6 +69,8 @@ In `.claude/skills/ingest/scripts/`:
 
 - `strip-images.py <input> [--out PATH]` — removes base64 data URIs and >500-char base64 blobs.
 - `pdf-to-text.py <input.pdf> [--out PATH] [--layout]` — extracts text via `pdftotext` (poppler); exits non-zero on scanned PDFs.
+- `extract-dated-interactions.py <text-file> --topic NAME --source-label LABEL [--skip-attendee X ...] [--dry-run]` — finds dated section headers like `Feb 16, 2015: Brian Hilgendorf` (or `Jim Judson + John Bredvik`), parses attendees, resolves them against the DB (creating stubs for unknowns), slices the body, and POSTs an `interaction` per section. Skips Matt-only journal entries / retrospective sections / TOC entries (anything matching `\.{3,}` dot-leader is treated as TOC). Always run with `--dry-run` first on an unfamiliar source.
+- `import-linkedin.py <Connections.csv> [--dry-run]` — opinionated wrapper around `merge-csv.py` for LinkedIn's `Connections.csv` export. Auto-detects + skips LinkedIn's `Notes:` preamble, bakes in the column mapping, and validates the schema before running. Exits non-zero on a non-LinkedIn CSV.
 - `merge-csv.py <csv> --first-col ... --last-col ... --email-col ... [--secondary-email-col ...] [--linkedin-col ...] [--org-col ...] [--phone-col ...] [--summary-cols A B C] [--how-known TEXT] [--source-label TEXT] [--skip-email EMAIL] [--skip-name NAME] [--api URL] [--log PATH] [--dry-run]` — dedupe-aware CSV merger.
 - `suggest-merges.py [--api URL] [--out PATH]` — finds near-duplicate person records by 4 heuristics: first+last-prefix, exact display_name, deaccented display_name, shared email.
 
@@ -92,18 +94,32 @@ Each script supports `--help`. Always pass `--dry-run` first on an unfamiliar CS
 
 ### LinkedIn Connections export
 
-LinkedIn's `Connections.csv` headers are `First Name, Last Name, URL, Email Address, Company, Position, Connected On`. Use:
+Use the dedicated wrapper — it auto-detects + skips LinkedIn's preamble (the `Notes:` lines LinkedIn prepends before the real header) and bakes in the column mapping:
+
 ```
-merge-csv.py "<csv>" \
-  --first-col "First Name" --last-col "Last Name" \
-  --email-col "Email Address" --linkedin-col URL \
-  --org-col Company \
-  --summary-cols Position "Connected On" \
-  --how-known "LinkedIn connection (imported)." \
-  --source-label "LinkedIn export"
+.claude/skills/ingest/scripts/import-linkedin.py "<Connections.csv>" --dry-run
+# eyeball, then drop --dry-run for the real run
+.claude/skills/ingest/scripts/import-linkedin.py "<Connections.csv>" --log /tmp/linkedin_log.json
 ```
 
-(Skip the first 2-3 metadata rows LinkedIn prepends — strip them before running.)
+How the user gets the file: LinkedIn → Settings & Privacy → Data Privacy → Get a copy of your data → check **Connections** only → Request archive. Email arrives ~10–60 min later with a zip; `Connections.csv` is inside.
+
+The wrapper validates that the file actually has the LinkedIn schema (`First Name, Last Name, URL, Email Address, Company, Position, Connected On`) and exits non-zero with a clear message if not — refuses to ingest unrelated CSVs as LinkedIn data.
+
+### Journal-style retrospective with dated meeting headers
+
+For a text/markdown/PDF source where each meeting is a `<Date>: <Attendee(s)>` section (e.g. a retrospective book, a year-end log, a deal-flow journal):
+
+```
+extract-dated-interactions.py "<source.txt>" \
+  --topic "<TopicName>" \
+  --source-label "<short label, e.g. 'zCrowd fundraising'>" \
+  --skip-attendee "<event-y header>" --skip-attendee "<another>" \
+  --log /tmp/interactions_log.json \
+  [--dry-run]
+```
+
+Always run `--dry-run` first; eyeball the parsed dates and attendee names. Common things to add to `--skip-attendee` after the dry-run: section titles that aren't people (`Funders Club`, `Bellingham Angel`, `Trilogy Meeting`, etc.). Multi-attendee headers (`Jim + John`, `Jim, Joe`) auto-split. Attendees not yet in the DB get auto-created with `how_known = "Met during <source-label> on <date>."`. Board minutes / minutes-only headers (`<Date> – Minutes`) need a separate hand-built insert if the attendee list is in the body — see `ingest/processed/2026-05-05/zCrowdBook_board.log.json` for a template.
 
 ### Google Contacts export
 

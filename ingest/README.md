@@ -39,7 +39,7 @@ In each of those cases the skill will tell you exactly which rule fired and wait
 | --- | --- | --- |
 | Markdown / plain-text notes (e.g. meeting notes) | `.md`, `.txt` | People mentioned, topics, interactions (meetings, calls), open loops |
 | Wild Apricot member roster | `.csv` | One person per row (recipe in `SKILL.md`) |
-| LinkedIn connections export | `.csv` | One person per row (recipe in `SKILL.md`) |
+| LinkedIn connections export | `.csv` | Use `.claude/skills/ingest/scripts/import-linkedin.py <Connections.csv>` — auto-strips LinkedIn's preamble and validates schema |
 | Google Contacts export | `.csv` | One person per row (column mapping confirmed interactively) |
 | Generic / unknown CSV | `.csv` | Claude will surface the header and ask for column mapping |
 | vCard | `.vcf` | Person + known emails / phones / org / title |
