@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api, Commitment, Interaction, Note, Person } from '../api';
 
 type Detail = {
@@ -185,7 +187,9 @@ export function PersonProfilePage() {
               <div className="when" style={{ fontWeight: 600, color: 'var(--text)' }}>
                 {new Date(d.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}
               </div>
-              <div style={{ whiteSpace: 'pre-wrap', marginTop: 6 }}>{d.body}</div>
+              <div className="deep-dive-body" style={{ marginTop: 6 }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{d.body}</ReactMarkdown>
+              </div>
             </div>
           ))
         )}
