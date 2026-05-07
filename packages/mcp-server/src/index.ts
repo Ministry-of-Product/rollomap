@@ -476,6 +476,251 @@ server.tool(
   },
 );
 
+// Matt's known interests / focus areas — used to flag overlaps during research.
+// Source: project memory + zCrowd/Pugetworks/CBRE history. Update as needed.
+const MATT_INTERESTS = [
+  'product management', 'OKRs', 'AI in education', 'machine learning',
+  'startups', 'fundraising', 'crowdsourcing', 'modded Minecraft',
+  'community building', 'Seattle tech', 'consulting',
+  'commercial real estate', 'EdTech', 'product leadership',
+  'electrical engineering', 'team building',
+];
+
+// ------- research_person -------
+// PREP step: resolves the target, returns context the agent needs to synthesize.
+// The agent (Claude) uses its own WebFetch on linkedin_url + any public sources,
+// or asks the user to paste profile text, then calls save_person_research.
+server.tool(
+  'research_person',
+  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), Matt\'s known interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research.',
+  {
+    linkedin_url: z.string().url().optional().describe('LinkedIn profile URL — preferred way to identify someone.'),
+    person_id: z.string().uuid().optional(),
+    name: z.string().optional(),
+  },
+  async ({ linkedin_url, person_id, name }) => {
+    if (!linkedin_url && !person_id && !name) {
+      return { isError: true, content: [{ type: 'text', text: 'Provide one of: linkedin_url, person_id, or name.' }] };
+    }
+
+    // Resolve
+    let person: Record<string, unknown> | null = null;
+    if (person_id) {
+      const r = await query(`SELECT * FROM person WHERE workspace_id = $1 AND id = $2`, [WORKSPACE_ID, person_id]);
+      person = r.rows[0] ?? null;
+    } else if (linkedin_url) {
+      // Try exact, then trailing-slash variants
+      const variants = [linkedin_url, linkedin_url.replace(/\/$/, ''), linkedin_url + '/'];
+      for (const v of variants) {
+        const r = await query(`SELECT * FROM person WHERE workspace_id = $1 AND linkedin_url = $2 LIMIT 1`, [WORKSPACE_ID, v]);
+        if (r.rowCount && r.rows[0]) { person = r.rows[0]; break; }
+      }
+    }
+    if (!person && name) {
+      const r = await query(
+        `SELECT * FROM person WHERE workspace_id = $1
+           AND (lower(display_name) = lower($2)
+                OR display_name ILIKE '%' || $2 || '%')
+         ORDER BY relationship_strength DESC LIMIT 1`,
+        [WORKSPACE_ID, name],
+      );
+      person = r.rows[0] ?? null;
+    }
+
+    // If still not found, create a stub from whatever we have so save_research has somewhere to land.
+    let stub_created = false;
+    if (!person) {
+      const display_name = name ?? (linkedin_url ? linkedin_url.replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//, '').replace(/\/$/, '') : 'Unknown');
+      const r = await query(
+        `INSERT INTO person (workspace_id, display_name, linkedin_url, how_known)
+         VALUES ($1, $2, $3, 'Created via research_person — not yet enriched.') RETURNING *`,
+        [WORKSPACE_ID, display_name, linkedin_url ?? null],
+      );
+      person = r.rows[0] ?? null;
+      stub_created = true;
+    }
+
+    if (!person) {
+      return { isError: true, content: [{ type: 'text', text: 'Could not resolve or create a person record.' }] };
+    }
+
+    const pid = person.id as string;
+
+    // Pull current topics, recent interactions, prior notes (especially research notes)
+    const [topicsRes, interactionsRes, notesRes] = await Promise.all([
+      query(
+        `SELECT t.name, pt.confidence, pt.user_confirmed, pt.last_evidence_at
+           FROM person_topic pt JOIN topic t ON t.id = pt.topic_id
+          WHERE pt.person_id = $1 ORDER BY pt.confidence DESC LIMIT 25`,
+        [pid],
+      ),
+      query(
+        `SELECT i.id, i.title, i.summary, i.interaction_type, i.occurred_at
+           FROM interaction i JOIN interaction_participant ip ON ip.interaction_id = i.id
+          WHERE ip.person_id = $1 ORDER BY i.occurred_at DESC LIMIT 8`,
+        [pid],
+      ),
+      query(`SELECT body, created_at FROM note WHERE person_id = $1 ORDER BY created_at DESC LIMIT 8`, [pid]),
+    ]);
+
+    // Pull prior Deep Dives separately so the agent can see how this person has changed over time.
+    const deepDivesRes = await query(
+      `SELECT id, body, created_at FROM note
+        WHERE person_id = $1 AND kind = 'deep_dive'
+        ORDER BY created_at DESC LIMIT 5`,
+      [pid],
+    );
+
+    return ok({
+      person: {
+        id: pid,
+        display_name: person.display_name,
+        primary_email: person.primary_email,
+        linkedin_url: person.linkedin_url,
+        company: person.company,
+        title: person.title,
+        summary: person.summary,
+        how_known: person.how_known,
+        first_seen_at: person.first_seen_at,
+        last_seen_at: person.last_seen_at,
+        last_researched_at: person.last_researched_at,
+        relationship_strength: Number(person.relationship_strength ?? 0),
+        interaction_count: person.interaction_count,
+        stub_created,
+      },
+      current_topics: topicsRes.rows,
+      recent_interactions: interactionsRes.rows,
+      prior_deep_dives: deepDivesRes.rows,
+      notes: notesRes.rows,
+      matt_interests: MATT_INTERESTS,
+      synthesis_instructions: [
+        '1. Use WebFetch to retrieve the linkedin_url if present. If LinkedIn returns a login wall or sparse content, ask the user to paste the profile text.',
+        '2. Optionally search for and fetch additional sources: personal site (often linked from the LinkedIn profile), Substack/Medium blog, Twitter/X, GitHub for technical folks, podcast/talk transcripts.',
+        '3. Synthesize a 2-3 paragraph Deep Dive synopsis: current focus, expertise/track record, what they\'re publicly thinking about lately.',
+        '4. Extract 5-15 topics that describe their expertise/interests. Use lowercase canonical forms (e.g. "fintech" not "FinTech").',
+        '5. Compute overlap: which of their topics intersect with matt_interests? List those as overlap_topics.',
+        '6. Call save_person_research with person_id, synopsis, topics (with confidence 0.5-1.0), overlap_topics, and sources (URLs of what you actually fetched). It will be appended as a dated Deep Dive entry — prior entries are preserved.',
+        'If the prior_deep_dives array is non-empty, treat this as a NEW dated entry: write a fresh synopsis that captures what is true now, noting any visible changes from the prior entries. Do not duplicate language verbatim.',
+      ],
+    });
+  },
+);
+
+// ------- save_person_research -------
+server.tool(
+  'save_person_research',
+  'Persist a Deep Dive synopsis for a person: appends a new dated entry to their Deep Dive history (note row with kind=\'deep_dive\'), attaches topics + overlap_topics, and sets last_researched_at = now(). Append-only — re-running on the same person creates a new dated entry rather than overwriting. Does NOT modify person.summary.',
+  {
+    person_id: z.string().uuid(),
+    synopsis: z.string().min(50).describe('Full 2-3 paragraph Deep Dive synthesis. Stored as-is (no marker prefix) — date comes from created_at, kind from the column.'),
+    topics: z.array(z.object({
+      name: z.string().min(1),
+      confidence: z.number().min(0).max(1).default(0.7),
+    })).default([]).describe('Topics describing the person\'s expertise/interests. Use lowercase canonical names.'),
+    overlap_topics: z.array(z.string()).default([]).describe('Subset of topics that overlap with Matt\'s known interests — gets confidence 1.0 and user_confirmed=true.'),
+    sources: z.array(z.string()).default([]).describe('URLs / labels of sources actually used to write the synopsis (LinkedIn profile, blog post URLs, etc.).'),
+  },
+  async ({ person_id, synopsis, topics, overlap_topics, sources }) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Verify person exists in this workspace
+      const personCheck = await client.query(
+        `SELECT id, display_name FROM person WHERE workspace_id = $1 AND id = $2`,
+        [WORKSPACE_ID, person_id],
+      );
+      if (personCheck.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return { isError: true, content: [{ type: 'text', text: 'person_not_found' }] };
+      }
+
+      // Build the Deep Dive note body — clean markdown, no marker.
+      // Sources and overlap rendered as trailing blocks for readability.
+      const overlapBlock = overlap_topics.length ? `\n\n**Overlap with Matt:** ${overlap_topics.join(', ')}` : '';
+      const sourcesBlock = sources.length ? `\n\n**Sources:**\n${sources.map(s => `- ${s}`).join('\n')}` : '';
+      const noteBody = `${synopsis}${overlapBlock}${sourcesBlock}`;
+
+      const noteRes = await client.query(
+        `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, 'deep_dive') RETURNING id, created_at`,
+        [WORKSPACE_ID, person_id, noteBody],
+      );
+
+      // Update last_researched_at only — leave person.summary alone so the
+      // existing manual / ingest-derived summary is preserved across passes.
+      await client.query(
+        `UPDATE person SET last_researched_at = now()
+          WHERE workspace_id = $1 AND id = $2`,
+        [WORKSPACE_ID, person_id],
+      );
+
+      // Build the merged topic list. Overlap topics get confidence 1.0 + user_confirmed.
+      const mergedTopics = new Map<string, { confidence: number; user_confirmed: boolean }>();
+      for (const t of topics) {
+        const key = t.name.trim().toLowerCase();
+        if (!key) continue;
+        const existing = mergedTopics.get(key);
+        const conf = Math.max(existing?.confidence ?? 0, t.confidence);
+        mergedTopics.set(key, { confidence: conf, user_confirmed: existing?.user_confirmed ?? false });
+      }
+      for (const o of overlap_topics) {
+        const key = o.trim().toLowerCase();
+        if (!key) continue;
+        mergedTopics.set(key, { confidence: 1.0, user_confirmed: true });
+      }
+
+      const topicResults: Array<{ name: string; topic_id: string; overlap: boolean }> = [];
+      for (const [name, meta] of mergedTopics) {
+        // Upsert topic by lowercase name
+        const topicUpsert = await client.query<{ id: string }>(
+          `INSERT INTO topic (workspace_id, name, created_by)
+           VALUES ($1, $2, 'agent')
+           ON CONFLICT (workspace_id, lower(name)) DO UPDATE SET name = topic.name
+           RETURNING id`,
+          [WORKSPACE_ID, name],
+        );
+        const tid = topicUpsert.rows[0]!.id;
+        // Upsert person_topic
+        await client.query(
+          `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed)
+           VALUES ($1, $2, $3, $4, 1, now(), $5)
+           ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE SET
+             confidence = GREATEST(person_topic.confidence, EXCLUDED.confidence),
+             evidence_count = person_topic.evidence_count + 1,
+             last_evidence_at = now(),
+             user_confirmed = person_topic.user_confirmed OR EXCLUDED.user_confirmed,
+             updated_at = now()`,
+          [WORKSPACE_ID, person_id, tid, meta.confidence, meta.user_confirmed],
+        );
+        topicResults.push({ name, topic_id: tid, overlap: overlap_topics.map(s => s.toLowerCase()).includes(name) });
+      }
+
+      // Audit
+      await client.query(
+        `INSERT INTO user_correction (workspace_id, entity_type, entity_id, correction_type, after_value)
+         VALUES ($1, 'person', $2, 'research', $3::jsonb)`,
+        [WORKSPACE_ID, person_id, JSON.stringify({ note_id: noteRes.rows[0]!.id, topic_count: topicResults.length, overlap_count: overlap_topics.length, sources })],
+      );
+
+      await client.query('COMMIT');
+
+      return ok({
+        person_id,
+        person_name: personCheck.rows[0]!.display_name,
+        note_id: noteRes.rows[0]!.id,
+        topics_attached: topicResults,
+        overlap_count: overlap_topics.length,
+        sources,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error('[rollomap-mcp] server connected over stdio');

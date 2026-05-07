@@ -23,11 +23,12 @@ notesRouter.post('/', async (req, res) => {
   const Body = z.object({
     person_id: z.string().uuid().nullable().optional(),
     body: z.string().min(1),
+    kind: z.enum(['note', 'deep_dive']).default('note'),
   });
   const data = Body.parse(req.body);
   const result = await query(
-    `INSERT INTO note (workspace_id, person_id, body) VALUES ($1, $2, $3) RETURNING *`,
-    [WORKSPACE_ID, data.person_id ?? null, data.body],
+    `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, $4) RETURNING *`,
+    [WORKSPACE_ID, data.person_id ?? null, data.body, data.kind],
   );
   res.status(201).json({ note: result.rows[0] });
 });

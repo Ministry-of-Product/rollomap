@@ -34,7 +34,7 @@ peopleRouter.get('/', async (req, res) => {
       WHERE pt.person_id = p.id AND lower(t.name) = lower($${params.length})
     )`;
   }
-  params.push(Math.min(Number(limit) || 100, 500));
+  params.push(Math.min(Number(limit) || 100, 5000));
 
   const result = await query(
     `SELECT p.*,
@@ -58,7 +58,7 @@ peopleRouter.get('/:id', async (req, res) => {
   );
   if (person.rowCount === 0) return res.status(404).json({ error: 'not_found' });
 
-  const [topics, interactions, notes, commitments, identities] = await Promise.all([
+  const [topics, interactions, notes, deepDives, commitments, identities] = await Promise.all([
     query(
       `SELECT t.id, t.name, pt.confidence, pt.evidence_count, pt.user_confirmed, pt.last_evidence_at
          FROM person_topic pt JOIN topic t ON t.id = pt.topic_id
@@ -73,7 +73,11 @@ peopleRouter.get('/:id', async (req, res) => {
       [id],
     ),
     query(
-      `SELECT * FROM note WHERE person_id = $1 ORDER BY created_at DESC`,
+      `SELECT * FROM note WHERE person_id = $1 AND kind = 'note' ORDER BY created_at DESC`,
+      [id],
+    ),
+    query(
+      `SELECT * FROM note WHERE person_id = $1 AND kind = 'deep_dive' ORDER BY created_at DESC`,
       [id],
     ),
     query(
@@ -91,6 +95,7 @@ peopleRouter.get('/:id', async (req, res) => {
     topics: topics.rows,
     interactions: interactions.rows,
     notes: notes.rows,
+    deep_dives: deepDives.rows,
     commitments: commitments.rows,
     identities: identities.rows,
   });

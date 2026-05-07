@@ -7,6 +7,7 @@ type Detail = {
   topics: { id: string; name: string; confidence: number; user_confirmed: boolean; last_evidence_at: string | null }[];
   interactions: Interaction[];
   notes: Note[];
+  deep_dives: Note[];
   commitments: Commitment[];
   identities: { id: string; identity_type: string; identity_value: string; confidence: number }[];
 };
@@ -36,7 +37,7 @@ export function PersonProfilePage() {
   useEffect(() => { load(); }, [id]);
 
   if (!data) return <div className="empty">Loading…</div>;
-  const { person, topics, interactions, notes, commitments } = data;
+  const { person, topics, interactions, notes, deep_dives, commitments } = data;
 
   const onSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -175,6 +176,22 @@ export function PersonProfilePage() {
       </div>
 
       <div className="card">
+        <h3>Deep Dive</h3>
+        {deep_dives.length === 0 ? (
+          <div className="empty" style={{ padding: 8 }}>No Deep Dive yet. Run <code>research_person</code> via the MCP to add one.</div>
+        ) : (
+          deep_dives.map(d => (
+            <div key={d.id} className="timeline-item" style={{ borderLeft: '3px solid var(--accent, #7c3aed)', paddingLeft: 10, marginBottom: 14 }}>
+              <div className="when" style={{ fontWeight: 600, color: 'var(--text)' }}>
+                {new Date(d.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}
+              </div>
+              <div style={{ whiteSpace: 'pre-wrap', marginTop: 6 }}>{d.body}</div>
+            </div>
+          ))
+        )}
+      </div>
+
+      <div className="card">
         <h3>Notes</h3>
         <form onSubmit={onAddNote} style={{ marginBottom: 12 }}>
           <textarea value={newNote} onChange={e => setNewNote(e.target.value)} placeholder="Add a note about this person…" />
@@ -182,7 +199,7 @@ export function PersonProfilePage() {
         </form>
         {notes.length === 0 ? <div className="empty" style={{ padding: 8 }}>No notes.</div> : notes.map(n => (
           <div key={n.id} className="timeline-item">
-            <div>{n.body}</div>
+            <div style={{ whiteSpace: 'pre-wrap' }}>{n.body}</div>
             <div className="when">{new Date(n.created_at).toLocaleString()}</div>
           </div>
         ))}
