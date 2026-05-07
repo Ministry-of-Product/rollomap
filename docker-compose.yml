@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: rollomap-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rollomap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rollomap}
+      POSTGRES_DB: ${POSTGRES_DB:-rollomap}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rollomap} -d ${POSTGRES_DB:-rollomap}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: packages/api/Dockerfile
+    container_name: rollomap-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-rollomap}:${POSTGRES_PASSWORD:-rollomap}@postgres:5432/${POSTGRES_DB:-rollomap}
+      API_PORT: 4000
+      WORKSPACE_ID: ${WORKSPACE_ID:-00000000-0000-0000-0000-000000000001}
+    ports:
+      - "${API_PORT:-4000}:4000"
+
+  webapp:
+    build:
+      context: .
+      dockerfile: packages/webapp/Dockerfile
+      args:
+        VITE_API_URL: http://localhost:${API_PORT:-4000}
+    container_name: rollomap-webapp
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${WEBAPP_PORT:-5173}:80"
+
+volumes:
+  postgres-data:

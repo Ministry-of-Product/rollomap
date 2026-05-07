@@ -1,0 +1,4 @@
+inbox/*
+processed/*
+!inbox/.gitkeep
+!processed/.gitkeep
