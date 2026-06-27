@@ -30,6 +30,7 @@ import { recordEvent } from './events.js';
 import { tombstoneEntity } from './tombstone.js';
 import { mergePeople } from './merge.js';
 import { assertField, getFieldConflicts } from './assertions.js';
+import { importBundle, type ShareBundle } from './sharing.js';
 import {
   makeDevice,
   teardownAll,
@@ -674,6 +675,72 @@ describe('e2e sync harness — isolated multi-device scenarios', () => {
     } catch (err) {
       if (devices[0]) await dumpEvents(devices[0], 's6a').catch(() => {});
       if (devices[1]) await dumpEvents(devices[1], 's6b').catch(() => {});
+      throw err;
+    } finally {
+      await teardownAll(devices);
+    }
+  });
+
+  // ── Scenario 7 ──────────────────────────────────────────────────────────────
+  // Regression for the cross-ticket blocker (MIN-938 × MIN-935 × MIN-932): an
+  // imported bundle person must emit person.created, otherwise its field.asserted
+  // events FK-fail on a peer and roll back the whole push batch.
+  it('Scenario 7: a share-import on A replicates the new person to B without FK failure', async () => {
+    const devices: Device[] = [];
+    try {
+      const a = await makeDevice('s7a');
+      const b = await makeDevice('s7b');
+      devices.push(a, b);
+
+      const bundle: ShareBundle = {
+        version: '1',
+        mode: 'snapshot',
+        shared_by: 'A Friend',
+        shared_at: new Date().toISOString(),
+        source_workspace_id: crypto.randomUUID(),
+        people: [
+          {
+            external_id: crypto.randomUUID(),
+            fields: {
+              display_name: 'Shared Carol',
+              company: 'Acme Co',
+              primary_email: 'carol@acme.test',
+            },
+          },
+        ],
+      };
+
+      // Import the bundle on A (creates a new owned person + source-backed assertions).
+      const result = await withDeviceTxn(a, (client) => importBundle(client, bundle));
+      assert.ok(result.created >= 1, `import must create the new person (created=${result.created})`);
+
+      const carolRes = await a.pool.query<{ id: string; company: string | null }>(
+        `SELECT id, company FROM person WHERE workspace_id = $1 AND lower(display_name) = lower($2)`,
+        [WORKSPACE_ID, 'Shared Carol'],
+      );
+      assert.equal(carolRes.rowCount, 1, 'Carol must exist on A after import');
+      const carolId = carolRes.rows[0]!.id;
+      assert.equal(carolRes.rows[0]!.company, 'Acme Co', 'company derived from bundle assertion on A');
+
+      // Sync A → B. Before the fix this threw a FK violation (person_field_assertion
+      // → person) and rolled back the entire batch; transferred would never resolve.
+      const atob = await syncDevices(a, b);
+      assert.ok(atob.transferred > 0, `sync must transfer the import events (got ${atob.transferred})`);
+
+      // The imported person and its derived canonical company must land on B.
+      assert.ok(await personExistsOn(b, carolId), 'imported Carol must replicate to B');
+      const carolOnB = await b.pool.query<{ company: string | null }>(
+        `SELECT company FROM person WHERE id = $1 AND workspace_id = $2`,
+        [carolId, WORKSPACE_ID],
+      );
+      assert.equal(
+        carolOnB.rows[0]!.company,
+        'Acme Co',
+        'company assertion must derive on B too (person.created applied before field.asserted)',
+      );
+    } catch (err) {
+      if (devices[0]) await dumpEvents(devices[0], 's7a').catch(() => {});
+      if (devices[1]) await dumpEvents(devices[1], 's7b').catch(() => {});
       throw err;
     } finally {
       await teardownAll(devices);

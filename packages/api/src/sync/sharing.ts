@@ -320,14 +320,25 @@ export async function importBundle(
           : bundlePerson.external_id
             ? `Imported contact ${bundlePerson.external_id}`
             : 'Unknown Contact';
-      const r = await client.query<{ id: string }>(
+      const r = await client.query(
         `INSERT INTO person (workspace_id, display_name)
          VALUES ($1, $2)
-         RETURNING id`,
+         RETURNING *`,
         [WORKSPACE_ID, displayName],
       );
-      personId = r.rows[0]!.id;
+      personId = r.rows[0]!.id as string;
       isNew = true;
+      // Emit person.created BEFORE any field.asserted for this person. Without it
+      // the imported person never replicates, and its field.asserted events would
+      // FK-fail (person_field_assertion.person_id → person) when a peer applies the
+      // batch, rolling back the whole push. server_seq ordering guarantees this
+      // create applies before the assertions on every device. (MIN-938 × MIN-935.)
+      await recordEvent(client, {
+        entityType: 'person',
+        entityId: personId,
+        operation: 'person.created',
+        payload: r.rows[0],
+      });
     }
 
     // ── 2. Assert all bundle fields via the assertions system ───────────────

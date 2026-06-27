@@ -22,9 +22,14 @@ CREATE TABLE IF NOT EXISTS contact_group (
 CREATE INDEX IF NOT EXISTS contact_group_workspace_idx ON contact_group (workspace_id);
 
 -- Reuse the existing set_updated_at() trigger from migration 001.
-CREATE TRIGGER contact_group_set_updated_at
-  BEFORE UPDATE ON contact_group
-  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- Guarded so re-applying this migration to an existing DB is idempotent
+-- (Postgres has no CREATE TRIGGER IF NOT EXISTS), matching migrations 004/005.
+DO $$ BEGIN
+  CREATE TRIGGER contact_group_set_updated_at
+    BEFORE UPDATE ON contact_group
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS contact_group_member (
   group_id   UUID NOT NULL REFERENCES contact_group(id) ON DELETE CASCADE,

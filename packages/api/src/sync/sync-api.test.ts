@@ -59,13 +59,6 @@ async function personExists(id: string): Promise<boolean> {
   return (r.rowCount ?? 0) > 0;
 }
 
-async function maxServerSeq(): Promise<number> {
-  const r = await pool.query<{ max: string | null }>(
-    `SELECT max(server_seq)::text AS max FROM sync_event`,
-  );
-  return r.rows[0]!.max ? Number(r.rows[0]!.max) : 0;
-}
-
 describe('sync replication API', () => {
   after(async () => {
     await pool.end();
