@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query, WORKSPACE_ID } from '../db.js';
 import { recordEvent, withSyncTxn } from '../sync/events.js';
 import { tombstoneEntity } from '../sync/tombstone.js';
+import { mergePeople, reverseMerge } from '../sync/merge.js';
 
 // Reads exclude tombstoned people (MIN-933): a deleted person keeps its
 // canonical row until compaction, so every read path must filter it out.
@@ -59,6 +60,27 @@ peopleRouter.get('/', async (req, res) => {
     params,
   );
   res.json({ people: result.rows });
+});
+
+// Merge history (MIN-934) — lightest debugging/correction surface: list the
+// person_merge records (most recent first), optionally filtered by ?person_id=
+// (matches either side of a merge). Registered BEFORE GET /:id so 'merges' is not
+// captured as a person id.
+peopleRouter.get('/merges', async (req, res) => {
+  const { person_id } = req.query as Record<string, string>;
+  const params: unknown[] = [WORKSPACE_ID];
+  let where = 'workspace_id = $1';
+  if (person_id) {
+    params.push(person_id);
+    where += ` AND (source_person_id = $2 OR target_person_id = $2)`;
+  }
+  const result = await query(
+    `SELECT id, source_person_id, target_person_id, merge_event_id, created_by_device_id,
+            created_at, reversed_at, reversed_by_device_id
+       FROM person_merge WHERE ${where} ORDER BY created_at DESC LIMIT 500`,
+    params,
+  );
+  res.json({ merges: result.rows });
 });
 
 peopleRouter.get('/:id', async (req, res) => {
@@ -247,71 +269,26 @@ peopleRouter.delete('/:id/topics/:topicId', async (req, res) => {
   res.json({ deleted: result.rowCount ?? 0 });
 });
 
-// Merge: move all references from `source_id` into `target_id`, then delete source.
+// Merge: move all references from `source_id` into `target_id`, then tombstone the
+// source as a redirect (MIN-933/934). Delegates to the shared, reversible,
+// sync-safe core in sync/merge.ts (same path apply.ts replays remote merges).
+// Response shape ({ ok: true }) is preserved; we additionally return merge_id so
+// callers can reverse it.
 peopleRouter.post('/merge', async (req, res) => {
   const Body = z.object({ target_id: z.string().uuid(), source_id: z.string().uuid() });
   const { target_id, source_id } = Body.parse(req.body);
   if (target_id === source_id) return res.status(400).json({ error: 'same_id' });
 
-  const client = await (await import('../db.js')).pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(
-      `INSERT INTO user_correction (workspace_id, entity_type, entity_id, correction_type, before_value)
-       VALUES ($1,'person',$2,'merge',$3::jsonb)`,
-      [WORKSPACE_ID, target_id, JSON.stringify({ merged_from: source_id })],
-    );
-    await client.query(
-      `UPDATE interaction_participant SET person_id = $1 WHERE workspace_id = $3 AND person_id = $2`,
-      [target_id, source_id, WORKSPACE_ID],
-    );
-    await client.query(
-      `UPDATE note SET person_id = $1 WHERE workspace_id = $3 AND person_id = $2`,
-      [target_id, source_id, WORKSPACE_ID],
-    );
-    await client.query(
-      `UPDATE commitment SET person_id = $1 WHERE workspace_id = $3 AND person_id = $2`,
-      [target_id, source_id, WORKSPACE_ID],
-    );
-    await client.query(
-      `UPDATE person_identity SET person_id = $1 WHERE workspace_id = $3 AND person_id = $2`,
-      [target_id, source_id, WORKSPACE_ID],
-    );
-    // Topics: ON CONFLICT keeps the higher confidence
-    await client.query(
-      `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed)
-         SELECT workspace_id, $1, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed
-           FROM person_topic WHERE workspace_id = $3 AND person_id = $2
-       ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE
-         SET confidence = GREATEST(person_topic.confidence, EXCLUDED.confidence),
-             evidence_count = person_topic.evidence_count + EXCLUDED.evidence_count`,
-      [target_id, source_id, WORKSPACE_ID],
-    );
-    await client.query(
-      `DELETE FROM person_topic WHERE workspace_id = $1 AND person_id = $2`,
-      [WORKSPACE_ID, source_id],
-    );
-    // Tombstone the source person instead of hard-deleting (MIN-933) so the
-    // removal is sync-consistent and can't be resurrected. NOTE for MIN-934:
-    // this is the minimal change — full reversible/sync-safe merge machinery
-    // (and replaying person.merged in apply.ts) is owned by that ticket.
-    await tombstoneEntity(client, {
-      entityType: 'person',
-      entityId: source_id,
-      reason: `merged into ${target_id}`,
-    });
-    await recordEvent(client, {
-      entityType: 'person',
-      entityId: target_id,
-      operation: 'person.merged',
-      payload: { target_id, source_id },
-    });
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
-  res.json({ ok: true });
+  const { mergeId } = await withSyncTxn((client) =>
+    mergePeople(client, { sourceId: source_id, targetId: target_id }),
+  );
+  res.json({ ok: true, merge_id: mergeId });
+});
+
+// Reverse a merge (MIN-934): un-tombstone the source, move its captured references
+// back, and emit person.merge_reversed so peers replicate the reversal.
+peopleRouter.post('/merges/:id/reverse', async (req, res) => {
+  const result = await withSyncTxn((client) => reverseMerge(client, { mergeId: req.params.id }));
+  if (!result) return res.status(404).json({ error: 'not_found_or_already_reversed' });
+  res.json({ ok: true, source_id: result.sourceId, target_id: result.targetId });
 });

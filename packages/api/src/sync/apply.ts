@@ -23,6 +23,7 @@
 import { WORKSPACE_ID } from '../db.js';
 import type { QueryableClient } from './device.js';
 import { insertTombstone, isTombstoned } from './tombstone.js';
+import { applyRemoteMerge, applyRemoteReverse, resolvePersonRedirect } from './merge.js';
 
 export interface ApplicableEvent {
   id?: string;
@@ -84,9 +85,16 @@ export async function applyEvent(
       return { applied: true };
 
     case 'person.merged':
-      // Best-effort no-op: real merge-sync is owned by MIN-934. Never block the
-      // batch on a merge we can't safely reconstruct here.
-      return { applied: false, reason: 'person.merged deferred to MIN-934' };
+      // Replay a peer's merge (MIN-934): idempotently move source→target refs,
+      // merge topics, record the person_merge row, and tombstone the source. Two
+      // devices merging the same A→B pair converge (each records its own
+      // person_merge row; both redirect source→target with no data loss).
+      return applyRemoteMerge(client, payload, event);
+
+    case 'person.merge_reversed':
+      // Replay a peer's reversal (MIN-934): restore the source + its captured
+      // references from THIS device's person_merge row. No-op if unknown locally.
+      return applyRemoteReverse(client, payload);
 
     case 'identity.added':
       return applyIdentity(client, payload);
@@ -167,6 +175,8 @@ async function applyIdentity(client: QueryableClient, p: Row): Promise<ApplyResu
   if (!p.person_id || !p.identity_type || !p.identity_value) {
     return { applied: false, reason: 'identity.added missing person_id/type/value' };
   }
+  // Map a merged-away source person onto its live target (MIN-934).
+  const personId = await resolvePersonRedirect(client, p.person_id as string);
   await client.query(
     `INSERT INTO person_identity
        (id, workspace_id, person_id, identity_type, identity_value, source_item_id, confidence, verified_by_user, created_at)
@@ -175,7 +185,7 @@ async function applyIdentity(client: QueryableClient, p: Row): Promise<ApplyResu
     [
       p.id ?? null,
       (p.workspace_id as string) ?? WORKSPACE_ID,
-      p.person_id,
+      personId,
       p.identity_type,
       p.identity_value,
       p.source_item_id ?? null,
@@ -214,6 +224,8 @@ async function applyTopicLink(client: QueryableClient, p: Row): Promise<ApplyRes
   if (!topicId || !p.person_id) {
     return { applied: false, reason: 'topic.linked unresolved topic/person — skipped' };
   }
+  // Map a merged-away source person onto its live target (MIN-934).
+  const personId = await resolvePersonRedirect(client, p.person_id as string);
   await client.query(
     `INSERT INTO person_topic
        (id, workspace_id, person_id, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed)
@@ -224,7 +236,7 @@ async function applyTopicLink(client: QueryableClient, p: Row): Promise<ApplyRes
     [
       p.id ?? null,
       (p.workspace_id as string) ?? WORKSPACE_ID,
-      p.person_id,
+      personId,
       topicId,
       p.confidence ?? 0.7,
       p.evidence_count ?? 0,
@@ -238,6 +250,10 @@ async function applyTopicLink(client: QueryableClient, p: Row): Promise<ApplyRes
 /** Insert a note keyed by its own id; idempotent. */
 async function applyNote(client: QueryableClient, p: Row): Promise<ApplyResult> {
   if (!p.id || !p.body) return { applied: false, reason: 'note.created missing id/body' };
+  // Map a merged-away source person onto its live target (MIN-934).
+  const personId = p.person_id
+    ? await resolvePersonRedirect(client, p.person_id as string)
+    : null;
   await client.query(
     `INSERT INTO note (id, workspace_id, person_id, body, kind, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, now()), COALESCE($7::timestamptz, now()))
@@ -245,7 +261,7 @@ async function applyNote(client: QueryableClient, p: Row): Promise<ApplyResult> 
     [
       p.id,
       (p.workspace_id as string) ?? WORKSPACE_ID,
-      p.person_id ?? null,
+      personId,
       p.body,
       p.kind ?? 'note',
       p.created_at ?? null,
@@ -279,7 +295,9 @@ async function applyInteraction(client: QueryableClient, p: Row): Promise<ApplyR
     ],
   );
   const participantIds = Array.isArray(p.participant_ids) ? (p.participant_ids as string[]) : [];
-  for (const personId of participantIds) {
+  for (const rawPersonId of participantIds) {
+    // Map a merged-away source person onto its live target (MIN-934).
+    const personId = await resolvePersonRedirect(client, rawPersonId);
     await client.query(
       `INSERT INTO interaction_participant (workspace_id, interaction_id, person_id)
        VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
