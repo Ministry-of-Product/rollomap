@@ -39,6 +39,12 @@ export const SYNC_OPERATIONS = [
   'note.created',
   'interaction.created',
   'field.asserted',
+  // Source connector lifecycle (MIN-937)
+  'connection.created',
+  'connection.paused',
+  'connection.resumed',
+  'connection.disconnected',
+  'source.removed',
 ] as const;
 
 export type SyncOperation = (typeof SYNC_OPERATIONS)[number];
