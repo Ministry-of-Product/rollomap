@@ -8,7 +8,10 @@
     "start": "node --import tsx src/index.ts",
     "seed": "tsx src/seed.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "build": "tsc",
+    "test:reset": "../../scripts/reset-test-db.sh",
+    "pretest": "npm run test:reset",
+    "test": "DATABASE_URL=${TEST_DATABASE_URL:-postgres://rollomap:rollomap@localhost:5432/rollomap_test} node --import tsx --test $(find src -name '*.test.ts')"
   },
   "dependencies": {
     "cors": "^2.8.5",
