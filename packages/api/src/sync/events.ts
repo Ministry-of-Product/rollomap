@@ -38,6 +38,7 @@ export const SYNC_OPERATIONS = [
   'topic.linked',
   'note.created',
   'interaction.created',
+  'field.asserted',
 ] as const;
 
 export type SyncOperation = (typeof SYNC_OPERATIONS)[number];

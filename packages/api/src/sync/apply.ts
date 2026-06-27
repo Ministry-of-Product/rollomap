@@ -24,6 +24,7 @@ import { WORKSPACE_ID } from '../db.js';
 import type { QueryableClient } from './device.js';
 import { insertTombstone, isTombstoned } from './tombstone.js';
 import { applyRemoteMerge, applyRemoteReverse, resolvePersonRedirect } from './merge.js';
+import { applyFieldAssertion } from './assertions.js';
 
 export interface ApplicableEvent {
   id?: string;
@@ -107,6 +108,13 @@ export async function applyEvent(
 
     case 'interaction.created':
       return applyInteraction(client, payload);
+
+    case 'field.asserted':
+      // Replay a peer's field-level contact assertion (MIN-935): upsert the row
+      // (idempotent) then re-derive the canonical person column so every device
+      // converges on the same winner. resolvePersonRedirect (inside) lands
+      // assertions about a merged-away source on the live target.
+      return applyFieldAssertion(client, payload);
 
     default:
       // Unknown operation — skip safely so newer producers don't break older

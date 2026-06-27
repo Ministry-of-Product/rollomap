@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID, pool } from '../db.js';
 import { recordEvent } from '../sync/events.js';
+import { assertField } from '../sync/assertions.js';
 
 export const sourcesRouter = Router();
 
@@ -111,6 +112,29 @@ sourcesRouter.post('/import', async (req, res) => {
             entityId: personId,
             operation: 'person.created',
             payload: created.rows[0],
+          });
+          // Imports create SOURCE-BACKED assertions (MIN-935): user_confirmed=false,
+          // tied to the source_item, so a later manual edit (user_confirmed=true)
+          // wins the canonical column while this import value stays queryable for
+          // provenance. We wire the fields the import actually populates on create —
+          // primary_email and display_name. DEFERRED: company/title/linkedin/aliases/
+          // phones are not extracted by this import path today, so there is nothing
+          // to assert for them yet; wire them here once the importer extracts them.
+          await assertField(client, {
+            personId,
+            fieldName: 'primary_email',
+            fieldValue: email,
+            sourceItemId: sourceId,
+            userConfirmed: false,
+            confidence: 1.0,
+          });
+          await assertField(client, {
+            personId,
+            fieldName: 'display_name',
+            fieldValue: created.rows[0].display_name,
+            sourceItemId: sourceId,
+            userConfirmed: false,
+            confidence: 1.0,
           });
           const identity = await client.query(
             `INSERT INTO person_identity (workspace_id, person_id, identity_type, identity_value)

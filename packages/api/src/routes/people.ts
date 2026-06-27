@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, WORKSPACE_ID } from '../db.js';
+import { query, pool, WORKSPACE_ID } from '../db.js';
 import { recordEvent, withSyncTxn } from '../sync/events.js';
 import { tombstoneEntity } from '../sync/tombstone.js';
 import { mergePeople, reverseMerge } from '../sync/merge.js';
+import { assertField, getAssertions, ASSERTABLE_FIELDS } from '../sync/assertions.js';
 
 // Reads exclude tombstoned people (MIN-933): a deleted person keeps its
 // canonical row until compaction, so every read path must filter it out.
@@ -163,10 +164,38 @@ peopleRouter.post('/', async (req, res) => {
       operation: 'person.created',
       payload: row,
     });
+    // Manual edits create user_confirmed assertions (MIN-935): record the provenance
+    // of each provided contact field IN ADDITION to the canonical column above. The
+    // canonical column is then derived (the just-created user_confirmed assertion
+    // wins), so reads are unchanged.
+    await assertProvidedFields(client, row.id, data);
     return row;
   });
   res.status(201).json({ person });
 });
+
+/**
+ * Write a user_confirmed (confidence 1.0, local-device) assertion for each provided
+ * contact field of a manual create/edit. Skips null/undefined values so an omitted
+ * field doesn't null out (or supersede) a column.
+ */
+async function assertProvidedFields(
+  client: Parameters<typeof assertField>[0],
+  personId: string,
+  data: Record<string, unknown>,
+): Promise<void> {
+  for (const field of ASSERTABLE_FIELDS) {
+    if (field in data && data[field] !== undefined && data[field] !== null) {
+      await assertField(client, {
+        personId,
+        fieldName: field,
+        fieldValue: data[field],
+        userConfirmed: true,
+        confidence: 1.0,
+      });
+    }
+  }
+}
 
 peopleRouter.patch('/:id', async (req, res) => {
   const data = PersonInput.partial().parse(req.body);
@@ -192,10 +221,20 @@ peopleRouter.patch('/:id', async (req, res) => {
       operation: 'person.updated',
       payload: row,
     });
+    // Manual edits create user_confirmed assertions (MIN-935) — see POST / above.
+    await assertProvidedFields(client, row.id, data);
     return row;
   });
   if (!person) return res.status(404).json({ error: 'not_found' });
   res.json({ person });
+});
+
+// Provenance surface (MIN-935): per-field assertions for a person, with their
+// source/device/confidence/user_confirmed, sorted by field then winner-first. Lets
+// the UI/API show WHERE each contact field came from and which competing values exist.
+peopleRouter.get('/:id/assertions', async (req, res) => {
+  const assertions = await getAssertions(pool, req.params.id);
+  res.json({ assertions });
 });
 
 peopleRouter.delete('/:id', async (req, res) => {
