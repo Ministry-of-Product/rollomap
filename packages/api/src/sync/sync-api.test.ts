@@ -123,12 +123,15 @@ describe('sync replication API', () => {
     const push = await pushEvents(deviceA, []);
     assert.deepEqual(push, { received: 0, applied: 0, duplicate: 0, skipped: 0 });
 
-    // Pull from the very tip — there is nothing newer.
-    const tip = await maxServerSeq();
-    const pull = await pullEvents(deviceA, { since: tip });
-    assert.equal(pull.count, 0, 'no events past the tip');
+    // Pull from a cursor far past any server_seq in this test run (the DB is reset
+    // before each run, so server_seqs stay in the low hundreds). Using a fixed
+    // large value instead of maxServerSeq() prevents a race where a concurrent
+    // test worker writes an event between the tip-capture and the pull call.
+    const FUTURE_CURSOR = 1_000_000;
+    const pull = await pullEvents(deviceA, { since: FUTURE_CURSOR });
+    assert.equal(pull.count, 0, 'no events past the future cursor');
     assert.equal(pull.events.length, 0);
-    assert.equal(pull.cursor, tip, 'cursor stays put when nothing new');
+    assert.equal(pull.cursor, FUTURE_CURSOR, 'cursor stays put when nothing new');
   });
 
   it('cursor advancement is explicit and idempotent (never regresses)', async () => {
