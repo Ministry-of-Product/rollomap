@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID } from '../db.js';
+import { recordEvent, withSyncTxn } from '../sync/events.js';
 
 export const notesRouter = Router();
 
@@ -26,11 +27,21 @@ notesRouter.post('/', async (req, res) => {
     kind: z.enum(['note', 'deep_dive']).default('note'),
   });
   const data = Body.parse(req.body);
-  const result = await query(
-    `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, $4) RETURNING *`,
-    [WORKSPACE_ID, data.person_id ?? null, data.body, data.kind],
-  );
-  res.status(201).json({ note: result.rows[0] });
+  const note = await withSyncTxn(async (client) => {
+    const result = await client.query(
+      `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [WORKSPACE_ID, data.person_id ?? null, data.body, data.kind],
+    );
+    const row = result.rows[0];
+    await recordEvent(client, {
+      entityType: 'note',
+      entityId: row.id,
+      operation: 'note.created',
+      payload: row,
+    });
+    return row;
+  });
+  res.status(201).json({ note });
 });
 
 notesRouter.delete('/:id', async (req, res) => {

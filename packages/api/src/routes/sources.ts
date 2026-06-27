@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID, pool } from '../db.js';
+import { recordEvent } from '../sync/events.js';
 
 export const sourcesRouter = Router();
 
@@ -95,16 +96,30 @@ sourcesRouter.post('/import', async (req, res) => {
         } else {
           const created = await client.query(
             `INSERT INTO person (workspace_id, display_name, primary_email)
-             VALUES ($1, $2, $3) RETURNING id`,
+             VALUES ($1, $2, $3) RETURNING *`,
             [WORKSPACE_ID, email.split('@')[0] ?? email, email],
           );
           personId = created.rows[0].id as string;
           people_created++;
-          await client.query(
+          await recordEvent(client, {
+            entityType: 'person',
+            entityId: personId,
+            operation: 'person.created',
+            payload: created.rows[0],
+          });
+          const identity = await client.query(
             `INSERT INTO person_identity (workspace_id, person_id, identity_type, identity_value)
-             VALUES ($1, $2, 'email', $3) ON CONFLICT DO NOTHING`,
+             VALUES ($1, $2, 'email', $3) ON CONFLICT DO NOTHING RETURNING *`,
             [WORKSPACE_ID, personId, email.toLowerCase()],
           );
+          if (identity.rowCount && identity.rows[0]) {
+            await recordEvent(client, {
+              entityType: 'person_identity',
+              entityId: personId,
+              operation: 'identity.added',
+              payload: identity.rows[0],
+            });
+          }
         }
         participantPersonIds.push(personId);
       }
@@ -119,7 +134,7 @@ sourcesRouter.post('/import', async (req, res) => {
         const ix = await client.query(
           `INSERT INTO interaction (workspace_id, source_item_id, interaction_type, title, summary, body, occurred_at)
            VALUES ($1,$2,$3,$4,$5,$6, coalesce($7::timestamptz, now()))
-           RETURNING id`,
+           RETURNING *`,
           [
             WORKSPACE_ID,
             sourceId,
@@ -131,6 +146,12 @@ sourcesRouter.post('/import', async (req, res) => {
           ],
         );
         const interactionId = ix.rows[0].id as string;
+        await recordEvent(client, {
+          entityType: 'interaction',
+          entityId: interactionId,
+          operation: 'interaction.created',
+          payload: { ...ix.rows[0], participant_ids: participantPersonIds },
+        });
 
         for (const personId of participantPersonIds) {
           await client.query(

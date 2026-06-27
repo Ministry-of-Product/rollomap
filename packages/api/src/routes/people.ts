@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID } from '../db.js';
+import { recordEvent, withSyncTxn } from '../sync/events.js';
 
 export const peopleRouter = Router();
 
@@ -103,26 +104,36 @@ peopleRouter.get('/:id', async (req, res) => {
 
 peopleRouter.post('/', async (req, res) => {
   const data = PersonInput.parse(req.body);
-  const result = await query(
-    `INSERT INTO person (workspace_id, display_name, primary_email, company, title, linkedin_url, summary, how_known, aliases, known_emails, known_phones, user_pinned)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
-     RETURNING *`,
-    [
-      WORKSPACE_ID,
-      data.display_name,
-      data.primary_email ?? null,
-      data.company ?? null,
-      data.title ?? null,
-      data.linkedin_url ?? null,
-      data.summary ?? null,
-      data.how_known ?? null,
-      JSON.stringify(data.aliases ?? []),
-      JSON.stringify(data.known_emails ?? []),
-      JSON.stringify(data.known_phones ?? []),
-      data.user_pinned ?? false,
-    ],
-  );
-  res.status(201).json({ person: result.rows[0] });
+  const person = await withSyncTxn(async (client) => {
+    const result = await client.query(
+      `INSERT INTO person (workspace_id, display_name, primary_email, company, title, linkedin_url, summary, how_known, aliases, known_emails, known_phones, user_pinned)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
+       RETURNING *`,
+      [
+        WORKSPACE_ID,
+        data.display_name,
+        data.primary_email ?? null,
+        data.company ?? null,
+        data.title ?? null,
+        data.linkedin_url ?? null,
+        data.summary ?? null,
+        data.how_known ?? null,
+        JSON.stringify(data.aliases ?? []),
+        JSON.stringify(data.known_emails ?? []),
+        JSON.stringify(data.known_phones ?? []),
+        data.user_pinned ?? false,
+      ],
+    );
+    const row = result.rows[0];
+    await recordEvent(client, {
+      entityType: 'person',
+      entityId: row.id,
+      operation: 'person.created',
+      payload: row,
+    });
+    return row;
+  });
+  res.status(201).json({ person });
 });
 
 peopleRouter.patch('/:id', async (req, res) => {
@@ -136,20 +147,43 @@ peopleRouter.patch('/:id', async (req, res) => {
     fields.push(`${k} = $${params.length}`);
   }
   if (fields.length === 0) return res.status(400).json({ error: 'no_fields' });
-  const result = await query(
-    `UPDATE person SET ${fields.join(', ')} WHERE workspace_id = $1 AND id = $2 RETURNING *`,
-    params,
-  );
-  if (result.rowCount === 0) return res.status(404).json({ error: 'not_found' });
-  res.json({ person: result.rows[0] });
+  const person = await withSyncTxn(async (client) => {
+    const result = await client.query(
+      `UPDATE person SET ${fields.join(', ')} WHERE workspace_id = $1 AND id = $2 RETURNING *`,
+      params,
+    );
+    if (result.rowCount === 0) return null;
+    const row = result.rows[0];
+    await recordEvent(client, {
+      entityType: 'person',
+      entityId: row.id,
+      operation: 'person.updated',
+      payload: row,
+    });
+    return row;
+  });
+  if (!person) return res.status(404).json({ error: 'not_found' });
+  res.json({ person });
 });
 
 peopleRouter.delete('/:id', async (req, res) => {
-  const result = await query(
-    `DELETE FROM person WHERE workspace_id = $1 AND id = $2`,
-    [WORKSPACE_ID, req.params.id],
-  );
-  res.json({ deleted: result.rowCount ?? 0 });
+  const deleted = await withSyncTxn(async (client) => {
+    const result = await client.query(
+      `DELETE FROM person WHERE workspace_id = $1 AND id = $2`,
+      [WORKSPACE_ID, req.params.id],
+    );
+    const count = result.rowCount ?? 0;
+    if (count > 0) {
+      await recordEvent(client, {
+        entityType: 'person',
+        entityId: req.params.id,
+        operation: 'person.deleted',
+        payload: { id: req.params.id },
+      });
+    }
+    return count;
+  });
+  res.json({ deleted });
 });
 
 // Attach a topic to a person.
@@ -158,34 +192,44 @@ peopleRouter.post('/:id/topics', async (req, res) => {
     .refine(b => b.topic_id || b.topic_name, { message: 'topic_id or topic_name required' });
   const body = Body.parse(req.body);
 
-  let topicId = body.topic_id;
-  if (!topicId && body.topic_name) {
-    const existing = await query(
-      `SELECT id FROM topic WHERE workspace_id = $1 AND lower(name) = lower($2)`,
-      [WORKSPACE_ID, body.topic_name],
-    );
-    if (existing.rowCount && existing.rows[0]) {
-      topicId = existing.rows[0].id as string;
-    } else {
-      const created = await query(
-        `INSERT INTO topic (workspace_id, name) VALUES ($1, $2) RETURNING id`,
+  const personTopic = await withSyncTxn(async (client) => {
+    let topicId = body.topic_id;
+    if (!topicId && body.topic_name) {
+      const existing = await client.query(
+        `SELECT id FROM topic WHERE workspace_id = $1 AND lower(name) = lower($2)`,
         [WORKSPACE_ID, body.topic_name],
       );
-      topicId = created.rows[0]!.id as string;
+      if (existing.rowCount && existing.rows[0]) {
+        topicId = existing.rows[0].id as string;
+      } else {
+        const created = await client.query(
+          `INSERT INTO topic (workspace_id, name) VALUES ($1, $2) RETURNING id`,
+          [WORKSPACE_ID, body.topic_name],
+        );
+        topicId = created.rows[0]!.id as string;
+      }
     }
-  }
 
-  const result = await query(
-    `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, user_confirmed)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE SET
-       confidence = EXCLUDED.confidence,
-       user_confirmed = EXCLUDED.user_confirmed,
-       updated_at = now()
-     RETURNING *`,
-    [WORKSPACE_ID, req.params.id, topicId, body.confidence ?? 0.7, body.user_confirmed ?? true],
-  );
-  res.status(201).json({ person_topic: result.rows[0] });
+    const result = await client.query(
+      `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, user_confirmed)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE SET
+         confidence = EXCLUDED.confidence,
+         user_confirmed = EXCLUDED.user_confirmed,
+         updated_at = now()
+       RETURNING *`,
+      [WORKSPACE_ID, req.params.id, topicId, body.confidence ?? 0.7, body.user_confirmed ?? true],
+    );
+    const row = result.rows[0];
+    await recordEvent(client, {
+      entityType: 'person_topic',
+      entityId: req.params.id,
+      operation: 'topic.linked',
+      payload: row,
+    });
+    return row;
+  });
+  res.status(201).json({ person_topic: personTopic });
 });
 
 peopleRouter.delete('/:id/topics/:topicId', async (req, res) => {
@@ -244,6 +288,12 @@ peopleRouter.post('/merge', async (req, res) => {
       `DELETE FROM person WHERE workspace_id = $1 AND id = $2`,
       [WORKSPACE_ID, source_id],
     );
+    await recordEvent(client, {
+      entityType: 'person',
+      entityId: target_id,
+      operation: 'person.merged',
+      payload: { target_id, source_id },
+    });
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
