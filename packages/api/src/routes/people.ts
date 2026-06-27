@@ -4,7 +4,7 @@ import { query, pool, WORKSPACE_ID } from '../db.js';
 import { recordEvent, withSyncTxn } from '../sync/events.js';
 import { tombstoneEntity } from '../sync/tombstone.js';
 import { mergePeople, reverseMerge } from '../sync/merge.js';
-import { assertField, getAssertions, ASSERTABLE_FIELDS } from '../sync/assertions.js';
+import { assertField, getAssertions, getFieldConflicts, ASSERTABLE_FIELDS } from '../sync/assertions.js';
 
 // Reads exclude tombstoned people (MIN-933): a deleted person keeps its
 // canonical row until compaction, so every read path must filter it out.
@@ -232,9 +232,18 @@ peopleRouter.patch('/:id', async (req, res) => {
 // Provenance surface (MIN-935): per-field assertions for a person, with their
 // source/device/confidence/user_confirmed, sorted by field then winner-first. Lets
 // the UI/API show WHERE each contact field came from and which competing values exist.
+//
+// MIN-936: also returns a computed `conflicts` section — for each single-value
+// canonical field with >1 distinct competing values and no user-confirmed winner,
+// the deterministic winner + every competing claim, flagged needs_review. (Computed,
+// not stored.) Surfaced HERE rather than a separate GET /conflicts so a client gets
+// provenance + the "needs review" signal in one round-trip.
 peopleRouter.get('/:id/assertions', async (req, res) => {
-  const assertions = await getAssertions(pool, req.params.id);
-  res.json({ assertions });
+  const [assertions, conflicts] = await Promise.all([
+    getAssertions(pool, req.params.id),
+    getFieldConflicts(pool, req.params.id),
+  ]);
+  res.json({ assertions, conflicts });
 });
 
 peopleRouter.delete('/:id', async (req, res) => {

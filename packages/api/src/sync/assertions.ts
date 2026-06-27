@@ -22,40 +22,36 @@ import type { QueryableClient } from './device.js';
 import { getLocalDeviceId } from './device.js';
 import { recordEvent } from './events.js';
 import { resolvePersonRedirect } from './merge.js';
+import {
+  FIELD_RESOLUTION,
+  SINGLE_VALUE_ORDER_SQL,
+  isUnionField,
+  isSingleValueField,
+  isPrimaryPreservingField,
+  resolveSingleValue,
+  compareAssertions,
+  type AssertionLike,
+} from './conflict-policy.js';
 
 type Row = Record<string, unknown>;
 
 /**
- * Single-value canonical columns: the winning assertion's value is written back.
- * Multi-value columns: the canonical column is the set-union of all live values.
- *
- * Both sets double as a WHITELIST — deriveCanonicalField only interpolates a column
- * name found here, so the dynamic UPDATE can't be a SQL-injection vector.
+ * Field classification is OWNED by conflict-policy.ts (MIN-936) — the single source
+ * of truth for the resolution policy. These derived sets are kept for back-compat:
+ *   - SINGLE_VALUE_FIELDS: winning assertion's value is written back (1 value).
+ *   - MULTI_VALUE_FIELDS: canonical column is the set-union of all live values.
+ * They double as a WHITELIST — deriveCanonicalField only interpolates a column name
+ * found in the policy, so the dynamic UPDATE can't be a SQL-injection vector.
  */
-export const SINGLE_VALUE_FIELDS = new Set([
-  'display_name',
-  'primary_email',
-  'company',
-  'title',
-  'linkedin_url',
-  'summary',
-  'how_known',
-]);
-export const MULTI_VALUE_FIELDS = new Set(['aliases', 'known_emails', 'known_phones']);
+export const SINGLE_VALUE_FIELDS = new Set(
+  Object.keys(FIELD_RESOLUTION).filter(isSingleValueField),
+);
+export const MULTI_VALUE_FIELDS = new Set(Object.keys(FIELD_RESOLUTION).filter(isUnionField));
 
 /** Fields the manual edit routes assert (in addition to keeping the column). */
-export const ASSERTABLE_FIELDS = [
-  'display_name',
-  'primary_email',
-  'company',
-  'title',
-  'linkedin_url',
-  'summary',
-  'how_known',
-  'aliases',
-  'known_emails',
-  'known_phones',
-] as const;
+export const ASSERTABLE_FIELDS = Object.keys(FIELD_RESOLUTION).filter(
+  (f) => f !== 'user_pinned',
+) as readonly string[];
 
 export interface AssertFieldInput {
   personId: string;
@@ -166,10 +162,10 @@ export async function applyFieldAssertion(
  * Pick the winning assertion(s) for one field and write the value back to the
  * canonical person column, keeping existing reads correct.
  *
- * >>> EXTENSION POINT (MIN-936): the SELECTION POLICY below is deliberately the
- * BORING default — prefer user_confirmed, then is_primary, then highest confidence,
- * then most-recent created_at. Refine it here (e.g. source trust, recency decay,
- * per-field rules). Multi-value fields are the set-union of all live values. <<<
+ * The SELECTION POLICY lives in conflict-policy.ts (MIN-936) — this function only
+ * EXECUTES it. Multi-value (union) fields are the set-union of all live values;
+ * single-value fields take the deterministic winner of SINGLE_VALUE_ORDER_SQL
+ * (whose trailing `id ASC` makes the winner identical on every device).
  *
  * Returns the derived canonical value, or undefined for an unknown field_name.
  */
@@ -178,10 +174,13 @@ export async function deriveCanonicalField(
   personId: string,
   fieldName: string,
 ): Promise<unknown> {
-  if (MULTI_VALUE_FIELDS.has(fieldName)) {
+  if (isUnionField(fieldName)) {
     const rows = await client.query<{ field_value: unknown }>(
+      // Deterministic scan order so the first-seen winner of a de-dup is stable
+      // across devices (created_at/id are replicated verbatim).
       `SELECT field_value FROM person_field_assertion
-        WHERE workspace_id = $1 AND person_id = $2 AND field_name = $3 AND superseded_at IS NULL`,
+        WHERE workspace_id = $1 AND person_id = $2 AND field_name = $3 AND superseded_at IS NULL
+        ORDER BY created_at ASC, id ASC`,
       [WORKSPACE_ID, personId, fieldName],
     );
     // Set-union, case-insensitively de-duplicated, first-seen value preserved.
@@ -203,11 +202,11 @@ export async function deriveCanonicalField(
     return union;
   }
 
-  if (SINGLE_VALUE_FIELDS.has(fieldName)) {
+  if (isSingleValueField(fieldName)) {
     const win = await client.query<{ field_value: unknown }>(
       `SELECT field_value FROM person_field_assertion
         WHERE workspace_id = $1 AND person_id = $2 AND field_name = $3 AND superseded_at IS NULL
-        ORDER BY user_confirmed DESC, is_primary DESC, confidence DESC, created_at DESC
+        ORDER BY ${SINGLE_VALUE_ORDER_SQL}
         LIMIT 1`,
       [WORKSPACE_ID, personId, fieldName],
     );
@@ -234,8 +233,98 @@ export async function getAssertions(client: QueryableClient, personId: string): 
             device_id, confidence, is_primary, user_confirmed, superseded_at, created_at
        FROM person_field_assertion
       WHERE workspace_id = $1 AND person_id = $2
-      ORDER BY field_name ASC, user_confirmed DESC, is_primary DESC, confidence DESC, created_at DESC`,
+      ORDER BY field_name ASC, ${SINGLE_VALUE_ORDER_SQL}`,
     [WORKSPACE_ID, personId],
   );
   return r.rows;
+}
+
+/** One competing claim, with enough provenance for a UI to explain it. */
+export interface CompetingValue {
+  assertion_id: string;
+  value: unknown;
+  confidence: number;
+  is_primary: boolean;
+  user_confirmed: boolean;
+  device_id: string | null;
+  source_connection_id: string | null;
+  source_item_id: string | null;
+  created_at: string | Date;
+}
+
+/** A single-value field with >1 distinct live values competing for the canonical slot. */
+export interface FieldConflict {
+  field_name: string;
+  /** The value the deterministic policy selects as canonical. */
+  winner: unknown;
+  /** True when a user-confirmed assertion settles the conflict (→ not needs_review). */
+  has_user_confirmed_winner: boolean;
+  /** Surface this to the user: distinct values disagree and nobody confirmed one. */
+  needs_review: boolean;
+  /** Every competing claim (winner first), with provenance. */
+  competing: CompetingValue[];
+}
+
+/**
+ * Computed "needs review" conflict signal (MIN-936) — no stored column.
+ *
+ * For each PRIMARY-PRESERVING single-value field (company/title/display_name/
+ * linkedin_url/summary/primary_email) with >1 DISTINCT live values, report the
+ * deterministic winner plus all competing claims+provenance, and flag needs_review
+ * when no user-confirmed assertion settles it. Low-risk (lww) fields are
+ * intentionally excluded — their conflicts are resolved last-write-wins silently.
+ */
+export async function getFieldConflicts(
+  client: QueryableClient,
+  personId: string,
+): Promise<FieldConflict[]> {
+  const r = await client.query<Row>(
+    `SELECT id, field_name, field_value, device_id, source_connection_id, source_item_id,
+            confidence, is_primary, user_confirmed, created_at
+       FROM person_field_assertion
+      WHERE workspace_id = $1 AND person_id = $2 AND superseded_at IS NULL`,
+    [WORKSPACE_ID, personId],
+  );
+
+  // Group live assertions by primary-preserving field name.
+  const byField = new Map<string, Row[]>();
+  for (const row of r.rows) {
+    const field = row.field_name as string;
+    if (!isPrimaryPreservingField(field)) continue;
+    (byField.get(field) ?? byField.set(field, []).get(field)!).push(row);
+  }
+
+  const conflicts: FieldConflict[] = [];
+  for (const [field, rows] of byField) {
+    const distinct = new Set(rows.map((x) => JSON.stringify(x.field_value ?? null)));
+    if (distinct.size <= 1) continue; // everyone agrees — not a conflict
+
+    const winner = resolveSingleValue(rows as unknown as AssertionLike[]);
+    const hasConfirmed = rows.some((x) => x.user_confirmed === true);
+    conflicts.push({
+      field_name: field,
+      winner: winner?.field_value,
+      has_user_confirmed_winner: hasConfirmed,
+      needs_review: !hasConfirmed,
+      competing: (rows as unknown as AssertionLike[])
+        .slice()
+        .sort(compareAssertions) // winner-first, same deterministic policy order
+        .map((x) => {
+          const row = x as unknown as Row;
+          return {
+            assertion_id: x.id,
+            value: x.field_value,
+            confidence: Number(x.confidence),
+            is_primary: Boolean(x.is_primary),
+            user_confirmed: Boolean(x.user_confirmed),
+            device_id: (row.device_id as string) ?? null,
+            source_connection_id: (row.source_connection_id as string) ?? null,
+            source_item_id: (row.source_item_id as string) ?? null,
+            created_at: x.created_at,
+          };
+        }),
+    });
+  }
+  conflicts.sort((a, b) => (a.field_name < b.field_name ? -1 : a.field_name > b.field_name ? 1 : 0));
+  return conflicts;
 }

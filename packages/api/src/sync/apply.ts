@@ -25,6 +25,7 @@ import type { QueryableClient } from './device.js';
 import { insertTombstone, isTombstoned } from './tombstone.js';
 import { applyRemoteMerge, applyRemoteReverse, resolvePersonRedirect } from './merge.js';
 import { applyFieldAssertion } from './assertions.js';
+import { tombstoneBlocksApply } from './conflict-policy.js';
 
 export interface ApplicableEvent {
   id?: string;
@@ -60,11 +61,13 @@ export async function applyEvent(
     case 'person.created':
     case 'person.updated': {
       const personId = (payload.id as string) ?? event.entity_id;
-      // Tombstone wins / no resurrection (MIN-933): if this person was already
-      // deleted, a stale create/update must NOT bring it back. This is the
-      // boring-correct default; strict delete-vs-later-update ordering (e.g. an
-      // update genuinely newer than the delete) is refined in MIN-936.
-      if (personId && (await isTombstoned(client, 'person', personId))) {
+      // Tombstone precedence / no resurrection (MIN-933, policy owned by MIN-936's
+      // conflict-policy.tombstoneBlocksApply): a delete is FINAL wrt sync ordering —
+      // a create/update never resurrects a tombstoned person regardless of the order
+      // events apply. Rationale: a tombstone is only compacted once every trusted
+      // device has acked past its delete event, so its presence means the delete is
+      // the latest known intent. (delete-wins, rule 4 in conflict-policy.ts.)
+      if (personId && tombstoneBlocksApply(await isTombstoned(client, 'person', personId))) {
         return { applied: false, reason: 'person is tombstoned — not resurrected' };
       }
       await applyPerson(client, payload);
