@@ -36,6 +36,11 @@ sourcesRouter.get('/items/:id', async (req, res) => {
   res.json({ source_item: result.rows[0] });
 });
 
+// source_item deletion is LOCAL-ONLY (MIN-933): source_items are never emitted
+// as sync events — the import path records person/identity/interaction events
+// but NOT source_item.created, and apply.ts has no source_item handler — so they
+// don't replicate across devices and cannot be resurrected by a peer's stale
+// push. There is therefore nothing to tombstone; a hard delete is correct here.
 sourcesRouter.delete('/items/:id', async (req, res) => {
   const result = await query(
     `DELETE FROM source_item WHERE workspace_id = $1 AND id = $2`,

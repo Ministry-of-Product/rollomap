@@ -2,6 +2,16 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID } from '../db.js';
 import { recordEvent, withSyncTxn } from '../sync/events.js';
+import { tombstoneEntity } from '../sync/tombstone.js';
+
+// Reads exclude tombstoned people (MIN-933): a deleted person keeps its
+// canonical row until compaction, so every read path must filter it out.
+const NOT_TOMBSTONED = `NOT EXISTS (
+  SELECT 1 FROM entity_tombstone et
+   WHERE et.workspace_id = p.workspace_id
+     AND et.entity_type = 'person'
+     AND et.entity_id = p.id
+)`;
 
 export const peopleRouter = Router();
 
@@ -22,7 +32,7 @@ const PersonInput = z.object({
 peopleRouter.get('/', async (req, res) => {
   const { q, topic, limit = '100' } = req.query as Record<string, string>;
   const params: unknown[] = [WORKSPACE_ID];
-  let where = 'p.workspace_id = $1';
+  let where = `p.workspace_id = $1 AND ${NOT_TOMBSTONED}`;
 
   if (q) {
     params.push(q);
@@ -54,7 +64,7 @@ peopleRouter.get('/', async (req, res) => {
 peopleRouter.get('/:id', async (req, res) => {
   const { id } = req.params;
   const person = await query(
-    `SELECT * FROM person WHERE workspace_id = $1 AND id = $2`,
+    `SELECT * FROM person p WHERE p.workspace_id = $1 AND p.id = $2 AND ${NOT_TOMBSTONED}`,
     [WORKSPACE_ID, id],
   );
   if (person.rowCount === 0) return res.status(404).json({ error: 'not_found' });
@@ -167,21 +177,18 @@ peopleRouter.patch('/:id', async (req, res) => {
 });
 
 peopleRouter.delete('/:id', async (req, res) => {
+  // Tombstone instead of hard-deleting (MIN-933): keep the canonical row, write
+  // an entity_tombstone, and emit a 'person.deleted' (= "tombstoned") event so
+  // peers don't resurrect the row. Response shape ({ deleted }) is unchanged:
+  // deleted=1 when a live person was tombstoned, 0 if it was missing/already gone.
   const deleted = await withSyncTxn(async (client) => {
-    const result = await client.query(
-      `DELETE FROM person WHERE workspace_id = $1 AND id = $2`,
+    const live = await client.query(
+      `SELECT 1 FROM person p WHERE p.workspace_id = $1 AND p.id = $2 AND ${NOT_TOMBSTONED}`,
       [WORKSPACE_ID, req.params.id],
     );
-    const count = result.rowCount ?? 0;
-    if (count > 0) {
-      await recordEvent(client, {
-        entityType: 'person',
-        entityId: req.params.id,
-        operation: 'person.deleted',
-        payload: { id: req.params.id },
-      });
-    }
-    return count;
+    if ((live.rowCount ?? 0) === 0) return 0;
+    await tombstoneEntity(client, { entityType: 'person', entityId: req.params.id });
+    return 1;
   });
   res.json({ deleted });
 });
@@ -284,10 +291,15 @@ peopleRouter.post('/merge', async (req, res) => {
       `DELETE FROM person_topic WHERE workspace_id = $1 AND person_id = $2`,
       [WORKSPACE_ID, source_id],
     );
-    await client.query(
-      `DELETE FROM person WHERE workspace_id = $1 AND id = $2`,
-      [WORKSPACE_ID, source_id],
-    );
+    // Tombstone the source person instead of hard-deleting (MIN-933) so the
+    // removal is sync-consistent and can't be resurrected. NOTE for MIN-934:
+    // this is the minimal change — full reversible/sync-safe merge machinery
+    // (and replaying person.merged in apply.ts) is owned by that ticket.
+    await tombstoneEntity(client, {
+      entityType: 'person',
+      entityId: source_id,
+      reason: `merged into ${target_id}`,
+    });
     await recordEvent(client, {
       entityType: 'person',
       entityId: target_id,

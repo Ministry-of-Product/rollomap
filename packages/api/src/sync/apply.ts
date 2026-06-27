@@ -22,6 +22,7 @@
 
 import { WORKSPACE_ID } from '../db.js';
 import type { QueryableClient } from './device.js';
+import { insertTombstone, isTombstoned } from './tombstone.js';
 
 export interface ApplicableEvent {
   id?: string;
@@ -55,16 +56,31 @@ export async function applyEvent(
   const payload = asRow(event.payload);
   switch (event.operation) {
     case 'person.created':
-    case 'person.updated':
+    case 'person.updated': {
+      const personId = (payload.id as string) ?? event.entity_id;
+      // Tombstone wins / no resurrection (MIN-933): if this person was already
+      // deleted, a stale create/update must NOT bring it back. This is the
+      // boring-correct default; strict delete-vs-later-update ordering (e.g. an
+      // update genuinely newer than the delete) is refined in MIN-936.
+      if (personId && (await isTombstoned(client, 'person', personId))) {
+        return { applied: false, reason: 'person is tombstoned — not resurrected' };
+      }
       await applyPerson(client, payload);
       return { applied: true };
+    }
 
     case 'person.deleted':
-      // Boring delete by id. Tombstone semantics arrive in MIN-933.
-      await client.query(`DELETE FROM person WHERE workspace_id = $1 AND id = $2`, [
-        (payload.workspace_id as string) ?? WORKSPACE_ID,
-        (payload.id as string) ?? event.entity_id,
-      ]);
+      // Tombstone (MIN-933) instead of hard-deleting, so a peer's later stale
+      // create/update can't resurrect the row. Idempotent via ON CONFLICT DO
+      // NOTHING. We KEEP the canonical row; compaction removes it later once all
+      // trusted devices have acked (see sync/tombstone.ts compactTombstones).
+      await insertTombstone(client, {
+        entityType: 'person',
+        entityId: (payload.id as string) ?? event.entity_id,
+        deletedByDeviceId: (payload.deleted_by_device_id as string) ?? event.device_id ?? null,
+        deleteEventId: event.id ?? null,
+        reason: (payload.reason as string) ?? null,
+      });
       return { applied: true };
 
     case 'person.merged':
