@@ -45,6 +45,14 @@ export const SYNC_OPERATIONS = [
   'connection.resumed',
   'connection.disconnected',
   'source.removed',
+  // Contact group / snapshot sharing (MIN-938)
+  'group.created',
+  'group.member_added',
+  // 'group.shared' is reserved for a future "sender sends a push notification of a share"
+  // feature. A pure bundle export (read-only) does NOT emit an event today because it
+  // mutates no local state and produces no artifact that needs to replicate. If we later
+  // add a share-log table, group.shared would record it. See docs/contact-sharing.md.
+  'group.imported',
 ] as const;
 
 export type SyncOperation = (typeof SYNC_OPERATIONS)[number];
