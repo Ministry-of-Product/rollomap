@@ -15,7 +15,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { pool } from '../db.js';
+import { pool, WORKSPACE_ID } from '../db.js';
 import {
   getCloudConfig,
   setCloudConfig,
@@ -27,9 +27,11 @@ import { cloudFetch, CloudAuthError, CloudNotConfiguredError } from './client.js
 // Single top-level pool teardown — runs after all suites in this file.
 after(async () => { await pool.end(); });
 
-// Clean the cloud_config table.
+// Clean this workspace's cloud_config row. Scoped by workspace so it does not
+// disturb other parallel test files that pair under a different workspace
+// (e.g. sync-agent.test.ts).
 async function resetConfig(): Promise<void> {
-  await pool.query('DELETE FROM cloud_config');
+  await pool.query('DELETE FROM cloud_config WHERE workspace_id = $1', [WORKSPACE_ID]);
 }
 
 describe('cloud config store', () => {

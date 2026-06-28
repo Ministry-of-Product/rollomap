@@ -13,6 +13,7 @@ import {
   setCloudConfig,
   clearCloudConfig,
 } from '../cloud/config.js';
+import { syncOnce } from '../cloud/sync-agent.js';
 
 export const cloudRouter = Router();
 
@@ -97,4 +98,24 @@ cloudRouter.get('/status', async (_req, res) => {
 cloudRouter.post('/disconnect', async (_req, res) => {
   await clearCloudConfig();
   return res.json({ disconnected: true });
+});
+
+// POST /api/cloud/sync
+// On-demand full sync cycle (push local changes, then pull peers' changes).
+// Returns the structured syncOnce result: counts, cursors, head_server_seq, and
+// any auth error. A not-paired client is a clean no-op ({ paired: false }).
+cloudRouter.post('/sync', async (_req, res) => {
+  try {
+    const result = await syncOnce();
+    if (!result.paired) {
+      return res.status(409).json({ error: 'not_paired', detail: 'Client is not paired with RolloMap Cloud — call POST /api/cloud/connect first.', ...result });
+    }
+    const authError = result.push.authError ?? result.pull.authError;
+    if (authError) {
+      return res.status(401).json({ error: 'auth_error', detail: authError.message, ...result });
+    }
+    return res.json(result);
+  } catch (err) {
+    return res.status(502).json({ error: 'sync_failed', detail: String(err) });
+  }
 });
