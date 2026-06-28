@@ -24,6 +24,8 @@ export function CloudPage() {
   const [token, setToken] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [seeding, setSeeding] = useState(false);
+  const [seedResult, setSeedResult] = useState<string | null>(null);
 
   const loadStatus = async () => {
     setLoading(true);
@@ -68,6 +70,23 @@ export function CloudPage() {
     }
   };
 
+  const onSeed = async () => {
+    setSeeding(true);
+    setSeedResult(null);
+    setError(null);
+    try {
+      const r = await api.post<{ totals: { emitted: number; skipped: number }; notPushable: { commitments: number } }>('/cloud/backfill');
+      setSeedResult(
+        `Seeded ${r.totals.emitted} events (${r.totals.skipped} already had events). ` +
+        (r.notPushable.commitments > 0 ? `${r.notPushable.commitments} commitment(s) skipped — no wire op yet.` : ''),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSeeding(false);
+    }
+  };
+
   if (loading) return <div className="empty">Loading…</div>;
 
   return (
@@ -90,9 +109,15 @@ export function CloudPage() {
               </>
             )}
           </div>
-          <div style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button className="btn" onClick={onDisconnect}>Disconnect</button>
+            <button className="btn" onClick={onSeed} disabled={seeding}>
+              {seeding ? 'Seeding…' : 'Seed cloud'}
+            </button>
           </div>
+          {seedResult && (
+            <div className="meta" style={{ marginTop: 8 }}>{seedResult}</div>
+          )}
           {error && <div className="meta" style={{ color: 'red', marginTop: 8 }}>{error}</div>}
         </div>
       ) : (

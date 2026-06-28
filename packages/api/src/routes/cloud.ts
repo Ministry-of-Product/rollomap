@@ -14,6 +14,7 @@ import {
   clearCloudConfig,
 } from '../cloud/config.js';
 import { syncOnce } from '../cloud/sync-agent.js';
+import { backfillSyncEvents } from '../cloud/backfill.js';
 
 export const cloudRouter = Router();
 
@@ -98,6 +99,20 @@ cloudRouter.get('/status', async (_req, res) => {
 cloudRouter.post('/disconnect', async (_req, res) => {
   await clearCloudConfig();
   return res.json({ disconnected: true });
+});
+
+// POST /api/cloud/backfill
+// Emit a creation sync_event for every existing entity that pre-dates the
+// sync_event log (MIN-975).  Idempotent: safe to call multiple times.  Run this
+// once after pairing a client that has a pre-existing graph, then POST /sync to
+// push the backfilled events to RolloMap Cloud.
+cloudRouter.post('/backfill', async (_req, res) => {
+  try {
+    const result = await backfillSyncEvents();
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: 'backfill_failed', detail: String(err) });
+  }
 });
 
 // POST /api/cloud/sync
