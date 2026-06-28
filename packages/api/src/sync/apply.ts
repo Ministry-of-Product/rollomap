@@ -103,6 +103,9 @@ export async function applyEvent(
     case 'identity.added':
       return applyIdentity(client, payload);
 
+    case 'topic.created':
+      return applyTopicCreated(client, payload, event.entity_id);
+
     case 'topic.linked':
       return applyTopicLink(client, payload);
 
@@ -204,6 +207,24 @@ async function applyIdentity(client: QueryableClient, p: Row): Promise<ApplyResu
       p.verified_by_user ?? false,
       p.created_at ?? null,
     ],
+  );
+  return { applied: true };
+}
+
+/** Insert a topic keyed by id and unique name; idempotent. */
+async function applyTopicCreated(
+  client: QueryableClient,
+  p: Row,
+  entityId?: string,
+): Promise<ApplyResult> {
+  const topicId = (p.id as string) ?? entityId ?? null;
+  const ws = (p.workspace_id as string) ?? WORKSPACE_ID;
+  if (!topicId || !p.name) {
+    return { applied: false, reason: 'topic.created missing id/name' };
+  }
+  await client.query(
+    `INSERT INTO topic (id, workspace_id, name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+    [topicId, ws, p.name],
   );
   return { applied: true };
 }

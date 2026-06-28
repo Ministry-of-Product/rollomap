@@ -52,19 +52,26 @@ syncRouter.post('/push', async (req, res) => {
   }
 });
 
-// GET /api/sync/pull?device_id=&since=&include_own=&limit=
+// GET /api/sync/pull?device_id=&since=&include_self=&limit=
 // Returns events the caller hasn't seen. `since` defaults to the device cursor.
+// `include_self` (wire contract param) controls whether the caller's own events
+// are returned; defaults to 0 (excluded). `include_own` is a deprecated alias
+// for `include_self` — prefer `include_self` for new callers.
 syncRouter.get('/pull', async (req, res) => {
+  const boolFlag = z.union([z.literal('1'), z.literal('true'), z.literal('0'), z.literal('false')]).optional();
   const Query = z.object({
     device_id: z.string().uuid(),
     since: z.coerce.number().int().nonnegative().optional(),
-    include_own: z
-      .union([z.literal('1'), z.literal('true'), z.literal('0'), z.literal('false')])
-      .optional(),
+    /** Wire-contract param name (preferred). */
+    include_self: boolFlag,
+    /** @deprecated Use include_self instead. */
+    include_own: boolFlag,
     limit: z.coerce.number().int().positive().optional(),
   });
   const q = Query.parse(req.query);
-  const includeOwn = q.include_own === '1' || q.include_own === 'true';
+  // include_self takes precedence; include_own is the deprecated alias.
+  const selfFlag = q.include_self ?? q.include_own;
+  const includeOwn = selfFlag === '1' || selfFlag === 'true';
   const result = await pullEvents(q.device_id, {
     since: q.since ?? null,
     includeOwn,
