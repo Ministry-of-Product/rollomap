@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { query, WORKSPACE_ID, pool } from '../db.js';
+import { recordEvent } from '../sync/events.js';
 
 export const interactionsRouter = Router();
 
@@ -101,6 +102,12 @@ interactionsRouter.post('/', async (req, res) => {
         [WORKSPACE_ID, data.occurred_at, personId],
       );
     }
+    await recordEvent(client, {
+      entityType: 'interaction',
+      entityId: interaction.id,
+      operation: 'interaction.created',
+      payload: { ...interaction, participant_ids: data.participant_ids ?? [] },
+    });
     await client.query('COMMIT');
     res.status(201).json({ interaction });
   } catch (err) {

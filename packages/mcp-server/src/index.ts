@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { pool, query, WORKSPACE_ID, tsQuery } from './db.js';
+import { recordEvent, withSyncTxn } from './sync-events.js';
 
 const server = new McpServer({
   name: 'rollomap',
@@ -31,27 +32,37 @@ server.tool(
     user_pinned: z.boolean().optional(),
   },
   async (data) => {
-    const result = await query(
-      `INSERT INTO person (workspace_id, display_name, primary_email, company, title, linkedin_url, summary, how_known, aliases, known_emails, known_phones, user_pinned)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
-       RETURNING *`,
-      [
-        WORKSPACE_ID,
-        data.display_name,
-        data.primary_email ?? null,
-        data.company ?? null,
-        data.title ?? null,
-        data.linkedin_url ?? null,
-        data.summary ?? null,
-        data.how_known ?? null,
-        JSON.stringify(data.aliases ?? []),
-        JSON.stringify(data.known_emails ?? []),
-        JSON.stringify(data.known_phones ?? []),
-        data.user_pinned ?? false,
-      ],
-    );
+    const person = await withSyncTxn(async (client) => {
+      const result = await client.query(
+        `INSERT INTO person (workspace_id, display_name, primary_email, company, title, linkedin_url, summary, how_known, aliases, known_emails, known_phones, user_pinned)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12)
+         RETURNING *`,
+        [
+          WORKSPACE_ID,
+          data.display_name,
+          data.primary_email ?? null,
+          data.company ?? null,
+          data.title ?? null,
+          data.linkedin_url ?? null,
+          data.summary ?? null,
+          data.how_known ?? null,
+          JSON.stringify(data.aliases ?? []),
+          JSON.stringify(data.known_emails ?? []),
+          JSON.stringify(data.known_phones ?? []),
+          data.user_pinned ?? false,
+        ],
+      );
+      const row = result.rows[0];
+      await recordEvent(client, {
+        entityType: 'person',
+        entityId: row.id,
+        operation: 'person.created',
+        payload: row,
+      });
+      return row;
+    });
 
-    return ok({ person: result.rows[0] });
+    return ok({ person });
   },
 );
 
@@ -333,11 +344,21 @@ server.tool(
     body: z.string().min(1),
   },
   async ({ person_id, body }) => {
-    const result = await query(
-      `INSERT INTO note (workspace_id, person_id, body) VALUES ($1, $2, $3) RETURNING *`,
-      [WORKSPACE_ID, person_id, body],
-    );
-    return ok({ note: result.rows[0] });
+    const note = await withSyncTxn(async (client) => {
+      const result = await client.query(
+        `INSERT INTO note (workspace_id, person_id, body) VALUES ($1, $2, $3) RETURNING *`,
+        [WORKSPACE_ID, person_id, body],
+      );
+      const row = result.rows[0];
+      await recordEvent(client, {
+        entityType: 'note',
+        entityId: row.id,
+        operation: 'note.created',
+        payload: row,
+      });
+      return row;
+    });
+    return ok({ note });
   },
 );
 
@@ -367,19 +388,30 @@ server.tool(
     if (fields.length === 0) {
       return { isError: true, content: [{ type: 'text', text: 'no fields to update' }] };
     }
-    const result = await query(
-      `UPDATE person SET ${fields.join(', ')} WHERE workspace_id = $1 AND id = $2 RETURNING *`,
-      params,
-    );
-    if (result.rowCount === 0) {
+    const person = await withSyncTxn(async (client) => {
+      const result = await client.query(
+        `UPDATE person SET ${fields.join(', ')} WHERE workspace_id = $1 AND id = $2 RETURNING *`,
+        params,
+      );
+      if (result.rowCount === 0) return null;
+      const row = result.rows[0];
+      await client.query(
+        `INSERT INTO user_correction (workspace_id, entity_type, entity_id, correction_type, after_value)
+         VALUES ($1, 'person', $2, 'update', $3::jsonb)`,
+        [WORKSPACE_ID, person_id, JSON.stringify(rest)],
+      );
+      await recordEvent(client, {
+        entityType: 'person',
+        entityId: row.id,
+        operation: 'person.updated',
+        payload: row,
+      });
+      return row;
+    });
+    if (!person) {
       return { isError: true, content: [{ type: 'text', text: 'person_not_found' }] };
     }
-    await query(
-      `INSERT INTO user_correction (workspace_id, entity_type, entity_id, correction_type, after_value)
-       VALUES ($1, 'person', $2, 'update', $3::jsonb)`,
-      [WORKSPACE_ID, person_id, JSON.stringify(rest)],
-    );
-    return ok({ person: result.rows[0] });
+    return ok({ person });
   },
 );
 
@@ -448,6 +480,12 @@ server.tool(
           );
         }
       }
+      await recordEvent(client, {
+        entityType: 'interaction',
+        entityId: interaction.id,
+        operation: 'interaction.created',
+        payload: { ...interaction, participant_ids },
+      });
       await client.query('COMMIT');
       return ok({ interaction, linked_topics: topicNames });
     } catch (err) {
@@ -531,12 +569,23 @@ server.tool(
     let stub_created = false;
     if (!person) {
       const display_name = name ?? (linkedin_url ? linkedin_url.replace(/^https?:\/\/(www\.)?linkedin\.com\/in\//, '').replace(/\/$/, '') : 'Unknown');
-      const r = await query(
-        `INSERT INTO person (workspace_id, display_name, linkedin_url, how_known)
-         VALUES ($1, $2, $3, 'Created via research_person — not yet enriched.') RETURNING *`,
-        [WORKSPACE_ID, display_name, linkedin_url ?? null],
-      );
-      person = r.rows[0] ?? null;
+      person = await withSyncTxn(async (client) => {
+        const r = await client.query(
+          `INSERT INTO person (workspace_id, display_name, linkedin_url, how_known)
+           VALUES ($1, $2, $3, 'Created via research_person — not yet enriched.') RETURNING *`,
+          [WORKSPACE_ID, display_name, linkedin_url ?? null],
+        );
+        const row = r.rows[0] ?? null;
+        if (row) {
+          await recordEvent(client, {
+            entityType: 'person',
+            entityId: row.id,
+            operation: 'person.created',
+            payload: row,
+          });
+        }
+        return row;
+      });
       stub_created = true;
     }
 
@@ -642,9 +691,15 @@ server.tool(
       const noteBody = `${synopsis}${overlapBlock}${sourcesBlock}`;
 
       const noteRes = await client.query(
-        `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, 'deep_dive') RETURNING id, created_at`,
+        `INSERT INTO note (workspace_id, person_id, body, kind) VALUES ($1, $2, $3, 'deep_dive') RETURNING *`,
         [WORKSPACE_ID, person_id, noteBody],
       );
+      await recordEvent(client, {
+        entityType: 'note',
+        entityId: noteRes.rows[0]!.id,
+        operation: 'note.created',
+        payload: noteRes.rows[0],
+      });
 
       // Update last_researched_at only — leave person.summary alone so the
       // existing manual / ingest-derived summary is preserved across passes.
@@ -681,7 +736,7 @@ server.tool(
         );
         const tid = topicUpsert.rows[0]!.id;
         // Upsert person_topic
-        await client.query(
+        const ptRes = await client.query(
           `INSERT INTO person_topic (workspace_id, person_id, topic_id, confidence, evidence_count, last_evidence_at, user_confirmed)
            VALUES ($1, $2, $3, $4, 1, now(), $5)
            ON CONFLICT (workspace_id, person_id, topic_id) DO UPDATE SET
@@ -689,9 +744,16 @@ server.tool(
              evidence_count = person_topic.evidence_count + 1,
              last_evidence_at = now(),
              user_confirmed = person_topic.user_confirmed OR EXCLUDED.user_confirmed,
-             updated_at = now()`,
+             updated_at = now()
+           RETURNING *`,
           [WORKSPACE_ID, person_id, tid, meta.confidence, meta.user_confirmed],
         );
+        await recordEvent(client, {
+          entityType: 'person_topic',
+          entityId: person_id,
+          operation: 'topic.linked',
+          payload: ptRes.rows[0],
+        });
         topicResults.push({ name, topic_id: tid, overlap: overlap_topics.map(s => s.toLowerCase()).includes(name) });
       }
 

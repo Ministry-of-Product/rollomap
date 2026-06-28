@@ -9,6 +9,9 @@ import { commitmentsRouter } from './routes/commitments.js';
 import { sourcesRouter } from './routes/sources.js';
 import { queryRouter } from './routes/query.js';
 import { statsRouter } from './routes/stats.js';
+import { devicesRouter } from './routes/devices.js';
+import { syncRouter } from './routes/sync.js';
+import { groupsRouter } from './routes/groups.js';
 import { pool } from './db.js';
 
 const app = express();
@@ -32,6 +35,9 @@ app.use('/api/commitments', commitmentsRouter);
 app.use('/api/sources', sourcesRouter);
 app.use('/api/query', queryRouter);
 app.use('/api/stats', statsRouter);
+app.use('/api/devices', devicesRouter);
+app.use('/api/sync', syncRouter);
+app.use('/api/groups', groupsRouter);
 
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);
