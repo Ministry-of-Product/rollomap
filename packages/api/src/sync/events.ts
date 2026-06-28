@@ -35,6 +35,7 @@ export const SYNC_OPERATIONS = [
   'person.merged',
   'person.merge_reversed',
   'identity.added',
+  'topic.created',
   'topic.linked',
   'note.created',
   'interaction.created',

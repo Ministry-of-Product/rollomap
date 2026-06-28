@@ -7,6 +7,7 @@
  * the full historical graph so pushOnce can send them to the cloud server.
  *
  * ── Dependency order (server_seq grows monotonically within each stage) ────────
+ *   Stage 0 — topics (topic.created must precede topic.linked in the event log)
  *   Stage 1 — persons + their identities + their topic links
  *   Stage 2 — interactions (reference persons via participants)
  *   Stage 3 — notes (reference persons via person_id)
@@ -15,6 +16,7 @@
  * ── Idempotency ────────────────────────────────────────────────────────────────
  *   Before emitting, we check sync_event for (workspace_id, entity_id, operation).
  *   Entity IDs used per operation:
+ *     topic.created       → topic.id
  *     person.created      → person.id
  *     identity.added      → person_identity.id   (per-identity; different from
  *                                                  sources.ts which uses person_id)
@@ -26,9 +28,6 @@
  *
  * ── SKIPPED (not pushable today) ─────────────────────────────────────────────
  *   commitment.created — no wire op for commitments exists in wire.ts.
- *   topic.created      — not a local pushable op; topic_name is carried in each
- *                        topic.linked payload so receiving peers can resolve/create
- *                        topics when applying those events.
  */
 
 import { pool, WORKSPACE_ID } from '../db.js';
@@ -98,6 +97,7 @@ async function countRows(table: string): Promise<number> {
  */
 export async function backfillSyncEvents(): Promise<BackfillResult> {
   const byOp: Record<string, OpCounts> = {
+    'topic.created': { emitted: 0, skipped: 0 },
     'person.created': { emitted: 0, skipped: 0 },
     'identity.added': { emitted: 0, skipped: 0 },
     'topic.linked': { emitted: 0, skipped: 0 },
@@ -107,6 +107,46 @@ export async function backfillSyncEvents(): Promise<BackfillResult> {
   };
 
   const commitments = await countRows('commitment');
+
+  // ── Stage 0: Topics ────────────────────────────────────────────────────────
+  // Must run BEFORE Stage 1 so every topic.created event has a LOWER server_seq
+  // than the topic.linked events that reference the same topic_id.  The cloud
+  // server's topic.linked handler does INSERT INTO person_topic ... with a FK on
+  // topic_id → topic(id); if the topic row doesn't exist yet the insert fails
+  // with a FK violation and the whole push batch rolls back.
+  {
+    let cursor = UUID_ZERO;
+    for (;;) {
+      const { rows: topics } = await pool.query<Row>(
+        `SELECT * FROM topic
+          WHERE workspace_id = $1 AND id > $2
+          ORDER BY id ASC
+          LIMIT $3`,
+        [WORKSPACE_ID, cursor, BATCH],
+      );
+      if (topics.length === 0) break;
+
+      await withSyncTxn(async (client) => {
+        for (const topic of topics) {
+          const topicId = topic.id as string;
+          if (await hasNoEvent(client, topicId, 'topic.created')) {
+            await recordEvent(client, {
+              entityType: 'topic',
+              entityId: topicId,
+              operation: 'topic.created',
+              payload: topic,
+            });
+            byOp['topic.created']!.emitted++;
+          } else {
+            byOp['topic.created']!.skipped++;
+          }
+        }
+      });
+
+      cursor = topics[topics.length - 1]!.id as string;
+      if (topics.length < BATCH) break;
+    }
+  }
 
   // ── Stage 1: Persons + identities + topic links ────────────────────────────
   // Process persons in cursor-paginated batches (by id).  Within each batch:

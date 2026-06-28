@@ -170,12 +170,14 @@ describe('backfillSyncEvents', () => {
     const result = await backfillSyncEvents();
 
     // Expected emitted counts:
+    //   topic.created:       1  (Engineering topic — Stage 0, precedes Stage 1)
     //   person.created:      2  (Person A + Person B)
     //   identity.added:      1  (email identity for Person A)
     //   topic.linked:        1  (Engineering → Person A)
     //   interaction.created: 1
     //   note.created:        1
     //   field.asserted:      1
+    assert.equal(result.byOp['topic.created']!.emitted, 1, 'one topic created');
     assert.equal(result.byOp['person.created']!.emitted, 2, 'two persons');
     assert.equal(result.byOp['identity.added']!.emitted, 1, 'one identity');
     assert.equal(result.byOp['topic.linked']!.emitted, 1, 'one topic link');
@@ -188,15 +190,16 @@ describe('backfillSyncEvents', () => {
       assert.equal(counts.skipped, 0, `${op}: expected 0 skipped on first run`);
     }
 
-    assert.equal(result.totals.emitted, 7, '7 total events emitted');
+    assert.equal(result.totals.emitted, 8, '8 total events emitted');
     assert.equal(result.totals.skipped, 0, '0 total skipped on first run');
   });
 
-  it('sync_event table now has exactly 7 rows in the correct operations', async () => {
+  it('sync_event table now has exactly 8 rows in the correct operations', async () => {
     const events = await syncEvents();
-    assert.equal(events.length, 7);
+    assert.equal(events.length, 8);
 
     const ops = events.map((e) => e.operation);
+    assert.equal(ops.filter((o) => o === 'topic.created').length, 1);
     assert.equal(ops.filter((o) => o === 'person.created').length, 2);
     assert.equal(ops.filter((o) => o === 'identity.added').length, 1);
     assert.equal(ops.filter((o) => o === 'topic.linked').length, 1);
@@ -211,51 +214,63 @@ describe('backfillSyncEvents', () => {
     // Check per-person: person A's creation precedes its identity and topic events.
     const events = await syncEvents();
 
+    const topicCreated = events.find(
+      (e) => e.operation === 'topic.created' && e.entity_id === topicId,
+    );
     const personACreated = events.find(
       (e) => e.operation === 'person.created' && e.entity_id === personAId,
     );
     const identityCreated = events.find((e) => e.operation === 'identity.added');
     const topicLinked = events.find((e) => e.operation === 'topic.linked');
 
+    assert.ok(topicCreated, 'topic.created event must exist');
     assert.ok(personACreated, 'person A created event must exist');
     assert.ok(identityCreated, 'identity.added event must exist');
     assert.ok(topicLinked, 'topic.linked event must exist');
 
+    const topicCreatedSeq = Number(topicCreated!.server_seq);
     const personASeq = Number(personACreated!.server_seq);
     const identitySeq = Number(identityCreated!.server_seq);
-    const topicSeq = Number(topicLinked!.server_seq);
+    const topicLinkedSeq = Number(topicLinked!.server_seq);
 
+    // Stage 0 (topic.created) must precede Stage 1 (topic.linked).
+    assert.ok(
+      topicCreatedSeq < topicLinkedSeq,
+      `topic.created (seq ${topicCreatedSeq}) must precede topic.linked (seq ${topicLinkedSeq})`,
+    );
     assert.ok(
       personASeq < identitySeq,
       `personA.created (seq ${personASeq}) must precede identity.added (seq ${identitySeq})`,
     );
     assert.ok(
-      personASeq < topicSeq,
-      `personA.created (seq ${personASeq}) must precede topic.linked (seq ${topicSeq})`,
+      personASeq < topicLinkedSeq,
+      `personA.created (seq ${personASeq}) must precede topic.linked (seq ${topicLinkedSeq})`,
     );
 
-    // Also verify global stage ordering: all person events precede all interaction
+    // Also verify global stage ordering: all Stage 0+1 events precede all Stage 2+
     // events (different stages = different withSyncTxn calls, so stage ordering
     // depends on sequential stage execution, not intra-batch ordering).
     const interactionCreated = events.find((e) => e.operation === 'interaction.created');
     const noteCreated = events.find((e) => e.operation === 'note.created');
     assert.ok(interactionCreated, 'interaction.created event must exist');
     assert.ok(noteCreated, 'note.created event must exist');
-    // Stage 1 (persons+deps) must complete before Stage 2 (interactions):
-    // the max server_seq from within Stage 1's batch should be < Stage 2's min.
-    const stage1Seqs = events
-      .filter((e) => ['person.created', 'identity.added', 'topic.linked'].includes(e.operation))
+    // Stage 0+1 (topics+persons+deps) must complete before Stage 2 (interactions):
+    // the max server_seq from within Stage 0+1's batch should be < Stage 2's min.
+    const stage01Seqs = events
+      .filter((e) =>
+        ['topic.created', 'person.created', 'identity.added', 'topic.linked'].includes(e.operation),
+      )
       .map((e) => Number(e.server_seq));
     const stage2PlusSeqs = events
       .filter((e) =>
         ['interaction.created', 'note.created', 'field.asserted'].includes(e.operation),
       )
       .map((e) => Number(e.server_seq));
-    const maxStage1 = Math.max(...stage1Seqs);
+    const maxStage01 = Math.max(...stage01Seqs);
     const minStage2Plus = Math.min(...stage2PlusSeqs);
     assert.ok(
-      maxStage1 < minStage2Plus,
-      `Stage 1 max seq (${maxStage1}) must be < Stage 2+ min seq (${minStage2Plus})`,
+      maxStage01 < minStage2Plus,
+      `Stage 0+1 max seq (${maxStage01}) must be < Stage 2+ min seq (${minStage2Plus})`,
     );
   });
 
@@ -283,6 +298,19 @@ describe('backfillSyncEvents', () => {
     assert.equal(ev.payload.person_id, personAId);
     assert.equal(ev.payload.identity_type, 'email');
     assert.equal(ev.payload.identity_value, 'person-a@example.com');
+  });
+
+  it('topic.created entity_id = topic id, payload has id + name', async () => {
+    const { rows } = await pool.query<SyncEventRow>(
+      `SELECT * FROM sync_event WHERE workspace_id=$1 AND operation='topic.created'`,
+      [WORKSPACE_ID],
+    );
+    assert.equal(rows.length, 1);
+    const ev = rows[0]!;
+    assert.equal(ev.entity_id, topicId, 'entity_id should be the topic row id');
+    assert.equal(ev.entity_type, 'topic');
+    assert.equal(ev.payload.id, topicId);
+    assert.equal(ev.payload.name, 'Engineering');
   });
 
   it('topic.linked entity_id = person_topic id, payload has person_id + topic_id + topic_name', async () => {
@@ -340,16 +368,16 @@ describe('backfillSyncEvents', () => {
 
   it('second backfill run: emits 0 new events (fully idempotent)', async () => {
     const before = await syncEvents();
-    assert.equal(before.length, 7, 'sanity: 7 events after first run');
+    assert.equal(before.length, 8, 'sanity: 8 events after first run');
 
     const result = await backfillSyncEvents();
 
     // All entities are now skipped — they have events from the first run.
     assert.equal(result.totals.emitted, 0, 'no new events on re-run');
-    assert.equal(result.totals.skipped, 7, 'all 7 entities skipped on re-run');
+    assert.equal(result.totals.skipped, 8, 'all 8 entities skipped on re-run');
 
     const after = await syncEvents();
-    assert.equal(after.length, 7, 'still exactly 7 events after second run');
+    assert.equal(after.length, 8, 'still exactly 8 events after second run');
   });
 
   // ── Live :8080 test (skipped if server unreachable) ───────────────────────

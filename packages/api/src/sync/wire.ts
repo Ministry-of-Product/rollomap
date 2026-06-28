@@ -230,6 +230,12 @@ const OP_TABLE: Readonly<Record<string, OpEntry>> = {
     wireEntityType: 'identity',
     localEntityType: 'person_identity',
   },
+  'topic.created': {
+    pushable: true,
+    wireOp: 'topic.created',
+    wireEntityType: 'topic',
+    localEntityType: 'topic',
+  },
   'topic.linked': {
     pushable: true,
     wireOp: 'topic.linked',

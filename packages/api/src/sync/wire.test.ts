@@ -110,6 +110,11 @@ const ROUND_TRIP_CASES: ReadonlyArray<{
     extra: { identity_type: 'email', identity_value: 'alice@example.com', person_id: uuid() },
   },
   {
+    localOp: 'topic.created',
+    entityType: 'topic',
+    extra: { name: 'AI' },
+  },
+  {
     localOp: 'topic.linked',
     entityType: 'person_topic',
     extra: { topic_name: 'AI', person_id: uuid() },
