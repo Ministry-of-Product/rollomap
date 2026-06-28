@@ -10,6 +10,7 @@ import { AskPage } from './pages/Ask';
 import { OpenLoopsPage } from './pages/OpenLoops';
 import { SourcesPage } from './pages/Sources';
 import { ReviewPage } from './pages/Review';
+import { CloudPage } from './pages/Cloud';
 
 type Stats = {
   people: string; interactions: string; topics: string;
@@ -34,6 +35,7 @@ export function App() {
           <NavLink to="/open-loops" className={({ isActive }) => isActive ? 'active' : ''}>Open loops</NavLink>
           <NavLink to="/review" className={({ isActive }) => isActive ? 'active' : ''}>Review</NavLink>
           <NavLink to="/sources" className={({ isActive }) => isActive ? 'active' : ''}>Sources</NavLink>
+          <NavLink to="/cloud" className={({ isActive }) => isActive ? 'active' : ''}>Cloud</NavLink>
         </nav>
         {stats && (
           <div className="stats">
@@ -59,6 +61,7 @@ export function App() {
           <Route path="/open-loops" element={<OpenLoopsPage />} />
           <Route path="/review" element={<ReviewPage />} />
           <Route path="/sources" element={<SourcesPage />} />
+          <Route path="/cloud" element={<CloudPage />} />
         </Routes>
       </main>
     </div>
