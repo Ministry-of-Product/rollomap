@@ -20,7 +20,7 @@ type CloudStatus =
 export function CloudPage() {
   const [status, setStatus] = useState<CloudStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [serverUrl, setServerUrl] = useState('');
+  const [serverUrl, setServerUrl] = useState('https://rollomap.com');
   const [token, setToken] = useState('');
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
