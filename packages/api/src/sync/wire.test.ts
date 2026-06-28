@@ -127,7 +127,7 @@ const ROUND_TRIP_CASES: ReadonlyArray<{
   {
     localOp: 'interaction.created',
     entityType: 'interaction',
-    extra: { title: 'Coffee chat', interaction_type: 'meeting' },
+    extra: { title: 'Coffee chat', interaction_type: 'meeting', participant_ids: [uuid(), uuid()] },
   },
   {
     localOp: 'field.asserted',
@@ -186,6 +186,10 @@ describe('wire.isPushable — edge cases', () => {
   });
 });
 
+// Ops that have payload transforms: wire payload != local payload by design.
+// The pass-through assertion is skipped for these; dedicated tests verify their shapes.
+const PAYLOAD_TRANSFORM_OPS = new Set(['identity.added', 'interaction.created']);
+
 // ─── Tests: round-trip fidelity ───────────────────────────────────────────────
 
 describe('wire round-trip — toWireEnvelope then fromWireEvent reconstructs local event', () => {
@@ -205,7 +209,11 @@ describe('wire round-trip — toWireEnvelope then fromWireEvent reconstructs loc
       assert.equal(wireEnv.id,            local.id,            'id preserved in push envelope');
       assert.equal(wireEnv.entity_id,     local.entity_id,     'entity_id preserved in push envelope');
       assert.equal(wireEnv.logical_clock, local.logical_clock,  'logical_clock preserved');
-      assert.deepEqual(wireEnv.payload,   local.payload,       'payload is a pass-through');
+      // For ops with payload transforms the wire payload intentionally differs from
+      // the local payload. Dedicated tests verify their shapes; skip here.
+      if (!PAYLOAD_TRANSFORM_OPS.has(localOp)) {
+        assert.deepEqual(wireEnv.payload, local.payload, 'payload is a pass-through');
+      }
       // device_id MUST NOT appear on the wire push envelope.
       assert.ok(
         !('device_id' in wireEnv),
@@ -223,7 +231,7 @@ describe('wire round-trip — toWireEnvelope then fromWireEvent reconstructs loc
       assert.equal(reconstructed.entity_type,   local.entity_type,   'entity_type (local type restored)');
       assert.equal(reconstructed.device_id,     local.device_id,     'device_id (from pull event)');
       assert.equal(reconstructed.logical_clock, local.logical_clock,  'logical_clock');
-      assert.deepEqual(reconstructed.payload,   local.payload,       'payload');
+      assert.deepEqual(reconstructed.payload,   local.payload,       'payload (lossless round-trip)');
       assert.equal(reconstructed.hash,          local.hash,          'hash');
       assert.equal(reconstructed.server_seq,    99,                  'server_seq from pull event');
     });
@@ -360,5 +368,204 @@ describe('wire coverage — isWireOp', () => {
     assert.equal(isWireOp('field.asserted'), false);
     assert.equal(isWireOp('connection.created'), false);
     assert.equal(isWireOp(''), false);
+  });
+});
+
+// ─── Tests: payload transforms — identity.added ───────────────────────────────
+
+describe('wire payload transform — identity.added', () => {
+  const personId = uuid();
+  const localPayload = {
+    id: uuid(),
+    workspace_id: uuid(),
+    person_id: personId,
+    identity_type: 'email',
+    identity_value: 'alice@example.com',
+  };
+
+  function makeIdentityEvent() {
+    return {
+      id: uuid(),
+      device_id: uuid(),
+      entity_type: 'person_identity',
+      entity_id: localPayload.id,
+      operation: 'identity.added',
+      payload: { ...localPayload },
+      logical_clock: 7,
+      hash: 'abc',
+    };
+  }
+
+  it('wire payload has server keys (kind, value) not client keys (identity_type, identity_value)', () => {
+    const local = makeIdentityEvent();
+    const wireEnv = toWireEnvelope(local);
+    assert.ok('kind' in wireEnv.payload,          'wire payload must have "kind"');
+    assert.ok('value' in wireEnv.payload,         'wire payload must have "value"');
+    assert.ok(!('identity_type' in wireEnv.payload),  'wire payload must NOT have "identity_type"');
+    assert.ok(!('identity_value' in wireEnv.payload), 'wire payload must NOT have "identity_value"');
+    assert.equal(wireEnv.payload['kind'],  'email',             'kind maps from identity_type');
+    assert.equal(wireEnv.payload['value'], 'alice@example.com', 'value maps from identity_value');
+  });
+
+  it('round-trip toWireEnvelope → fromWireEvent restores exact client payload', () => {
+    const local = makeIdentityEvent();
+    const wireEnv = toWireEnvelope(local);
+    const pullEvent = asPullEvent(wireEnv, local.device_id, 5);
+    const reconstructed = fromWireEvent(pullEvent);
+    assert.deepEqual(reconstructed.payload, local.payload, 'client payload round-trips losslessly');
+  });
+
+  it('server-shaped pull payload (kind/value) → fromWireEvent → client shape (identity_type/identity_value)', () => {
+    const serverPayload = {
+      id: uuid(),
+      workspace_id: uuid(),
+      person_id: personId,
+      kind: 'linkedin',
+      value: 'https://linkedin.com/in/alice',
+      label: 'personal',
+    };
+    const pull: WirePullEvent = {
+      id: uuid(),
+      server_seq: 3,
+      entity_type: 'identity',
+      entity_id: serverPayload.id,
+      op: 'identity.added',
+      payload: { ...serverPayload },
+      logical_clock: 2,
+      device_id: uuid(),
+      created_at: new Date().toISOString(),
+    };
+    const local = fromWireEvent(pull);
+    assert.ok('identity_type' in local.payload,  'client payload must have "identity_type"');
+    assert.ok('identity_value' in local.payload, 'client payload must have "identity_value"');
+    assert.ok(!('kind' in local.payload),        'client payload must NOT have "kind"');
+    assert.ok(!('value' in local.payload),       'client payload must NOT have "value"');
+    // label has no client column — must be dropped
+    assert.ok(!('label' in local.payload),       'client payload must NOT have "label"');
+    assert.equal(local.payload['identity_type'],  'linkedin',                        'identity_type from kind');
+    assert.equal(local.payload['identity_value'], 'https://linkedin.com/in/alice',   'identity_value from value');
+  });
+
+  it('missing identity_type/identity_value on push yields undefined kind/value (no crash)', () => {
+    const local = makeIdentityEvent();
+    (local.payload as Record<string, unknown>) = { id: uuid(), workspace_id: uuid(), person_id: personId };
+    const wireEnv = toWireEnvelope(local);
+    // Doesn't throw; kind/value are present (as undefined / missing key or undefined value)
+    assert.ok(!('identity_type' in wireEnv.payload), 'identity_type not in wire payload');
+  });
+});
+
+// ─── Tests: payload transforms — interaction.created ─────────────────────────
+
+describe('wire payload transform — interaction.created', () => {
+  const pid1 = uuid();
+  const pid2 = uuid();
+  const interactionId = uuid();
+  const wsId = uuid();
+
+  function makeInteractionEvent(override?: Record<string, unknown>) {
+    const payload: Record<string, unknown> = {
+      id: interactionId,
+      workspace_id: wsId,
+      interaction_type: 'meeting',
+      title: 'Coffee chat',
+      summary: 'Discussed product roadmap',
+      occurred_at: '2026-06-27T10:00:00Z',
+      participant_ids: [pid1, pid2],
+      ...override,
+    };
+    return {
+      id: uuid(),
+      device_id: uuid(),
+      entity_type: 'interaction',
+      entity_id: interactionId,
+      operation: 'interaction.created',
+      payload,
+      logical_clock: 12,
+      hash: 'def',
+    };
+  }
+
+  it('wire payload has server keys (channel, participants) not client keys (interaction_type, participant_ids)', () => {
+    const local = makeInteractionEvent();
+    const wireEnv = toWireEnvelope(local);
+    assert.ok('channel' in wireEnv.payload,          'wire payload must have "channel"');
+    assert.ok('participants' in wireEnv.payload,      'wire payload must have "participants"');
+    assert.ok(!('interaction_type' in wireEnv.payload),  'wire payload must NOT have "interaction_type"');
+    assert.ok(!('participant_ids' in wireEnv.payload),   'wire payload must NOT have "participant_ids"');
+    assert.equal(wireEnv.payload['channel'], 'meeting', 'channel maps from interaction_type');
+    const parts = wireEnv.payload['participants'] as Array<{ person_id: string; role: string }>;
+    assert.equal(parts.length, 2, 'two participants');
+    assert.equal(parts[0].person_id, pid1, 'first participant person_id');
+    assert.equal(parts[0].role,      'participant', 'role is "participant"');
+    assert.equal(parts[1].person_id, pid2, 'second participant person_id');
+  });
+
+  it('title passes through to wire payload (server ignores it, but it must not be dropped)', () => {
+    const local = makeInteractionEvent();
+    const wireEnv = toWireEnvelope(local);
+    assert.equal(wireEnv.payload['title'], 'Coffee chat', 'title passes through to wire');
+  });
+
+  it('round-trip toWireEnvelope → fromWireEvent restores exact client payload', () => {
+    const local = makeInteractionEvent();
+    const wireEnv = toWireEnvelope(local);
+    const pullEvent = asPullEvent(wireEnv, local.device_id, 11);
+    const reconstructed = fromWireEvent(pullEvent);
+    assert.deepEqual(reconstructed.payload, local.payload, 'client payload round-trips losslessly');
+  });
+
+  it('server-shaped pull payload (channel/participants) → fromWireEvent → client shape', () => {
+    const serverPayload = {
+      id: interactionId,
+      workspace_id: wsId,
+      channel: 'call',
+      summary: 'Quick sync',
+      occurred_at: '2026-06-27T11:00:00Z',
+      participants: [
+        { person_id: pid1, role: 'participant' },
+        { person_id: pid2, role: 'host' },
+      ],
+    };
+    const pull: WirePullEvent = {
+      id: uuid(),
+      server_seq: 8,
+      entity_type: 'interaction',
+      entity_id: interactionId,
+      op: 'interaction.created',
+      payload: { ...serverPayload },
+      logical_clock: 5,
+      device_id: uuid(),
+      created_at: new Date().toISOString(),
+    };
+    const local = fromWireEvent(pull);
+    assert.ok('interaction_type' in local.payload,  'client payload must have "interaction_type"');
+    assert.ok('participant_ids' in local.payload,   'client payload must have "participant_ids"');
+    assert.ok(!('channel' in local.payload),        'client payload must NOT have "channel"');
+    assert.ok(!('participants' in local.payload),   'client payload must NOT have "participants"');
+    assert.equal(local.payload['interaction_type'], 'call', 'interaction_type from channel');
+    assert.deepEqual(local.payload['participant_ids'], [pid1, pid2], 'participant_ids from participants[].person_id');
+  });
+
+  it('missing participant_ids on push yields empty participants array (no crash)', () => {
+    const local = makeInteractionEvent({ participant_ids: undefined });
+    const wireEnv = toWireEnvelope(local);
+    assert.deepEqual(wireEnv.payload['participants'], [], 'undefined participant_ids → empty participants');
+  });
+
+  it('missing participants on pull yields empty participant_ids array (no crash)', () => {
+    const pull: WirePullEvent = {
+      id: uuid(),
+      server_seq: 1,
+      entity_type: 'interaction',
+      entity_id: interactionId,
+      op: 'interaction.created',
+      payload: { channel: 'email', summary: 'Newsletter' },
+      logical_clock: 1,
+      device_id: uuid(),
+      created_at: new Date().toISOString(),
+    };
+    const local = fromWireEvent(pull);
+    assert.deepEqual(local.payload['participant_ids'], [], 'missing participants → empty participant_ids');
   });
 });
