@@ -186,6 +186,17 @@ interface WireMapped {
    * Must match what recordEvent callers store in sync_event.entity_type.
    */
   localEntityType: string;
+  /**
+   * Optional per-op transform: client-shaped payload → server/wire-shaped payload (on push).
+   * When absent, the payload is passed through unchanged.
+   */
+  toWirePayload?: (p: Record<string, unknown>) => Record<string, unknown>;
+  /**
+   * Optional per-op transform: server/wire-shaped payload → client-shaped payload (on pull).
+   * When absent, the payload is passed through unchanged.
+   * Must be the exact inverse of toWirePayload so the round-trip is lossless.
+   */
+  fromWirePayload?: (p: Record<string, unknown>) => Record<string, unknown>;
 }
 
 interface LocalOnly {
@@ -229,6 +240,16 @@ const OP_TABLE: Readonly<Record<string, OpEntry>> = {
     wireOp: 'identity.added',
     wireEntityType: 'identity',
     localEntityType: 'person_identity',
+    // Client stores `identity_type` / `identity_value`; server expects `kind` / `value`.
+    toWirePayload(p) {
+      const { identity_type, identity_value, ...rest } = p;
+      return { ...rest, kind: identity_type, value: identity_value };
+    },
+    fromWirePayload(p) {
+      // `label` exists on the server side but has no client column — drop it on pull.
+      const { kind, value, label: _label, ...rest } = p;
+      return { ...rest, identity_type: kind, identity_value: value };
+    },
   },
   'topic.created': {
     pushable: true,
@@ -253,6 +274,28 @@ const OP_TABLE: Readonly<Record<string, OpEntry>> = {
     wireOp: 'interaction.created',
     wireEntityType: 'interaction',
     localEntityType: 'interaction',
+    // Client stores `interaction_type` + `participant_ids: uuid[]`; server expects
+    // `channel` + `participants: [{person_id, role}]`.
+    toWirePayload(p) {
+      const { interaction_type, participant_ids, ...rest } = p;
+      const ids = Array.isArray(participant_ids) ? (participant_ids as unknown[]) : [];
+      return {
+        ...rest,
+        channel: interaction_type,
+        participants: ids.map((id) => ({ person_id: id as string, role: 'participant' })),
+      };
+    },
+    fromWirePayload(p) {
+      const { channel, participants, ...rest } = p;
+      const parts = Array.isArray(participants)
+        ? (participants as Array<Record<string, unknown>>)
+        : [];
+      return {
+        ...rest,
+        interaction_type: channel,
+        participant_ids: parts.map((x) => x.person_id as string),
+      };
+    },
   },
   /**
    * field.asserted → assertion.added
@@ -324,15 +367,31 @@ export const LOCAL_TO_WIRE_OP: Readonly<Record<string, WireOp>> = Object.fromEnt
  * Wire-op → local reconstruction map. Covers only wire ops that have a known
  * local equivalent (the mapped subset). Wire ops absent from this map (e.g.
  * identity.removed, commitment.*) pass through fromWireEvent unchanged.
+ *
+ * `fromWirePayload` is included when the op has a payload transform so that
+ * fromWireEvent can translate server-shaped payloads back to client shape.
  */
 export const WIRE_TO_LOCAL_OP: Readonly<
-  Partial<Record<WireOp, { localOp: string; localEntityType: string }>>
+  Partial<
+    Record<
+      WireOp,
+      {
+        localOp: string;
+        localEntityType: string;
+        fromWirePayload?: (p: Record<string, unknown>) => Record<string, unknown>;
+      }
+    >
+  >
 > = Object.fromEntries(
   Object.entries(OP_TABLE)
     .filter((pair): pair is [string, WireMapped] => pair[1].pushable === true)
     .map(([localOp, entry]) => [
       entry.wireOp,
-      { localOp, localEntityType: entry.localEntityType },
+      {
+        localOp,
+        localEntityType: entry.localEntityType,
+        fromWirePayload: entry.fromWirePayload,
+      },
     ]),
 );
 
@@ -378,12 +437,15 @@ export function toWireEnvelope(localEvent: {
   const mapped = entry as WireMapped;
 
   // Payload must be an object on the wire (protocol requires Record<string,unknown>).
-  const payload =
+  const rawPayload =
     localEvent.payload !== null &&
     typeof localEvent.payload === 'object' &&
     !Array.isArray(localEvent.payload)
       ? (localEvent.payload as Record<string, unknown>)
       : {};
+
+  // Apply per-op payload transform (client shape → server/wire shape) when defined.
+  const payload = mapped.toWirePayload ? mapped.toWirePayload(rawPayload) : rawPayload;
 
   return {
     id: localEvent.id,
@@ -411,13 +473,18 @@ export function fromWireEvent(wireEvent: WirePullEvent): LocalEventShape {
     ? WIRE_TO_LOCAL_OP[wireEvent.op]
     : undefined;
 
+  // Apply per-op payload transform (server/wire shape → client shape) when defined.
+  const payload = reversal?.fromWirePayload
+    ? reversal.fromWirePayload(wireEvent.payload)
+    : wireEvent.payload;
+
   return {
     id: wireEvent.id,
     device_id: wireEvent.device_id,
     entity_type: reversal?.localEntityType ?? wireEvent.entity_type,
     entity_id: wireEvent.entity_id,
     operation: reversal?.localOp ?? wireEvent.op,
-    payload: wireEvent.payload,
+    payload,
     logical_clock: wireEvent.logical_clock,
     hash: wireEvent.hash ?? '',
     server_seq: wireEvent.server_seq,
