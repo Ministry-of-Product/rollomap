@@ -230,27 +230,51 @@ async function applyTopicCreated(
 }
 
 /**
- * Link a person to a topic. The topic is resolved by name when the payload
- * carries one (creating it if needed), else by an explicit topic_id. If neither
- * can be resolved we skip rather than fail the FK (the topic will arrive on its
- * own event in a later batch).
+ * Link a person to a topic. Resolution order:
+ *  1. If topic_name is present: look up by name (case-insensitive), creating the
+ *     topic row when absent. The payload's topic_id is used as the new row's id
+ *     when supplied, so a later topic.created for the same id is a no-op.
+ *  2. If topic_name is absent but topic_id is present: verify the row exists to
+ *     avoid an FK violation. If it doesn't exist yet, skip — the topic.created
+ *     event will arrive in a later batch (MIN-984).
+ *  3. If neither can be resolved, skip.
  */
 async function applyTopicLink(client: QueryableClient, p: Row): Promise<ApplyResult> {
   let topicId = (p.topic_id as string) ?? null;
   const topicName = (p.topic_name as string) ?? null;
+  const ws = (p.workspace_id as string) ?? WORKSPACE_ID;
   if (topicName) {
+    // Self-heal: resolve by name, creating the row when absent.
+    // Use the payload's topic_id as the insert id so topic.created for that id
+    // lands as ON CONFLICT DO NOTHING rather than minting a duplicate row.
     const existing = await client.query<{ id: string }>(
       `SELECT id FROM topic WHERE workspace_id = $1 AND lower(name) = lower($2)`,
-      [(p.workspace_id as string) ?? WORKSPACE_ID, topicName],
+      [ws, topicName],
     );
     if (existing.rowCount && existing.rows[0]) {
       topicId = existing.rows[0].id;
     } else {
       const created = await client.query<{ id: string }>(
-        `INSERT INTO topic (workspace_id, name) VALUES ($1, $2) RETURNING id`,
-        [(p.workspace_id as string) ?? WORKSPACE_ID, topicName],
+        `INSERT INTO topic (id, workspace_id, name)
+         VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3)
+         RETURNING id`,
+        [topicId, ws, topicName],
       );
       topicId = created.rows[0]!.id;
+    }
+  } else if (topicId) {
+    // No topic_name to self-heal from. Check the row exists before attempting the
+    // FK-constrained person_topic insert — if absent, skip gracefully so a missing
+    // dependency cannot FK-violate and roll back the entire push batch (MIN-984).
+    const check = await client.query<{ id: string }>(
+      `SELECT id FROM topic WHERE id = $1`,
+      [topicId],
+    );
+    if (!check.rowCount) {
+      return {
+        applied: false,
+        reason: `topic.linked deferred — topic ${topicId} not yet on server`,
+      };
     }
   }
   if (!topicId || !p.person_id) {
@@ -267,7 +291,7 @@ async function applyTopicLink(client: QueryableClient, p: Row): Promise<ApplyRes
        user_confirmed = EXCLUDED.user_confirmed`,
     [
       p.id ?? null,
-      (p.workspace_id as string) ?? WORKSPACE_ID,
+      ws,
       personId,
       topicId,
       p.confidence ?? 0.7,

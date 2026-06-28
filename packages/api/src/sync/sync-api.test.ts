@@ -199,4 +199,182 @@ describe('sync replication API', () => {
     assert.equal(result.skipped, 1, 'unknown op stored but not applied');
     assert.equal(result.duplicate, 0);
   });
+
+  // MIN-984: topic.linked self-healing and per-event resilience.
+
+  it('topic.linked with topic_name self-heals: creates topic + link even when topic row is absent', async () => {
+    const deviceA = await makeDevice('tl-selfheal');
+    const personId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO person (id, workspace_id, display_name) VALUES ($1, $2, $3)`,
+      [personId, WORKSPACE_ID, 'Topic Self-Heal Person'],
+    );
+
+    const topicId = crypto.randomUUID();
+    const linkEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'person_topic',
+      entity_id: crypto.randomUUID(),
+      operation: 'topic.linked',
+      payload: {
+        person_id: personId,
+        topic_id: topicId,
+        topic_name: 'Self-Heal Topic',
+        workspace_id: WORKSPACE_ID,
+        confidence: 0.9,
+        user_confirmed: true,
+      },
+      logical_clock: 1,
+      hash: 'tl-selfheal',
+    };
+
+    const result = await pushEvents(deviceA, [linkEv]);
+    assert.equal(result.applied, 1, 'topic.linked must be applied when topic_name present');
+    assert.equal(result.skipped, 0);
+
+    // Topic row must exist (created by self-healing).
+    const topicRow = await pool.query(
+      `SELECT id FROM topic WHERE workspace_id = $1 AND lower(name) = lower($2)`,
+      [WORKSPACE_ID, 'Self-Heal Topic'],
+    );
+    assert.equal(topicRow.rowCount, 1, 'topic row must have been created');
+
+    // person_topic link must exist.
+    const linkRow = await pool.query(
+      `SELECT 1 FROM person_topic WHERE person_id = $1 AND topic_id = $2`,
+      [personId, topicRow.rows[0]!.id],
+    );
+    assert.equal(linkRow.rowCount, 1, 'person_topic link must have been created');
+  });
+
+  it('topic.linked self-heal preserves payload topic_id so a later topic.created is idempotent', async () => {
+    const deviceA = await makeDevice('tl-idempotent');
+    const personId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO person (id, workspace_id, display_name) VALUES ($1, $2, $3)`,
+      [personId, WORKSPACE_ID, 'Idempotent Person'],
+    );
+
+    const topicId = crypto.randomUUID();
+    const linkEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'person_topic',
+      entity_id: crypto.randomUUID(),
+      operation: 'topic.linked',
+      payload: {
+        person_id: personId,
+        topic_id: topicId,
+        topic_name: 'Idempotent Topic',
+        workspace_id: WORKSPACE_ID,
+      },
+      logical_clock: 1,
+      hash: 'tl-idempotent',
+    };
+    await pushEvents(deviceA, [linkEv]);
+
+    // The topic row must use the payload's topic_id.
+    const topicRow = await pool.query(`SELECT id FROM topic WHERE id = $1`, [topicId]);
+    assert.equal(topicRow.rowCount, 1, 'topic must exist with the payload topic_id');
+
+    // Now push topic.created for the same id — must be a no-op (not a duplicate row).
+    const createdEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'topic',
+      entity_id: topicId,
+      operation: 'topic.created',
+      payload: { id: topicId, name: 'Idempotent Topic', workspace_id: WORKSPACE_ID },
+      logical_clock: 2,
+      hash: 'tc-idempotent',
+    };
+    const r2 = await pushEvents(deviceA, [createdEv]);
+    assert.equal(r2.applied, 1, 'topic.created must succeed idempotently');
+
+    // Still only one topic row.
+    const all = await pool.query(
+      `SELECT id FROM topic WHERE workspace_id = $1 AND lower(name) = lower($2)`,
+      [WORKSPACE_ID, 'Idempotent Topic'],
+    );
+    assert.equal(all.rowCount, 1, 'must not create a duplicate topic row');
+  });
+
+  it('topic.linked without topic_name and missing topic row is skipped — does not 500 the batch', async () => {
+    const deviceA = await makeDevice('tl-missing');
+    const personId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO person (id, workspace_id, display_name) VALUES ($1, $2, $3)`,
+      [personId, WORKSPACE_ID, 'Missing Topic Person'],
+    );
+
+    const missingTopicId = crypto.randomUUID(); // never inserted
+    const linkEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'person_topic',
+      entity_id: crypto.randomUUID(),
+      operation: 'topic.linked',
+      payload: {
+        person_id: personId,
+        topic_id: missingTopicId,
+        // no topic_name — cannot self-heal
+        workspace_id: WORKSPACE_ID,
+      },
+      logical_clock: 1,
+      hash: 'tl-missing',
+    };
+
+    // Must not throw (no 500).
+    const result = await pushEvents(deviceA, [linkEv]);
+    assert.equal(result.skipped, 1, 'topic.linked with missing topic must be skipped');
+    assert.equal(result.applied, 0);
+
+    // No phantom person_topic row.
+    const link = await pool.query(
+      `SELECT 1 FROM person_topic WHERE person_id = $1 AND topic_id = $2`,
+      [personId, missingTopicId],
+    );
+    assert.equal(link.rowCount, 0, 'no person_topic row must be written for a skipped event');
+  });
+
+  it('topic.linked failure does not roll back other valid events in the same batch (MIN-984)', async () => {
+    const deviceA = await makeDevice('tl-isolation');
+    const personId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO person (id, workspace_id, display_name) VALUES ($1, $2, $3)`,
+      [personId, WORKSPACE_ID, 'Isolation Person'],
+    );
+
+    const missingTopicId = crypto.randomUUID(); // never inserted
+    const newPersonId = crypto.randomUUID();
+
+    const linkEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'person_topic',
+      entity_id: crypto.randomUUID(),
+      operation: 'topic.linked',
+      payload: { person_id: personId, topic_id: missingTopicId, workspace_id: WORKSPACE_ID },
+      logical_clock: 1,
+      hash: 'tl-isolation-link',
+    };
+    const personEv: SyncEventEnvelope = {
+      id: crypto.randomUUID(),
+      device_id: deviceA,
+      entity_type: 'person',
+      entity_id: newPersonId,
+      operation: 'person.created',
+      payload: { id: newPersonId, workspace_id: WORKSPACE_ID, display_name: 'Valid New Person' },
+      logical_clock: 2,
+      hash: 'tl-isolation-person',
+    };
+
+    const result = await pushEvents(deviceA, [linkEv, personEv]);
+    // topic.linked skipped, person.created applied.
+    assert.equal(result.skipped, 1);
+    assert.equal(result.applied, 1);
+    // The person must exist despite the skipped topic.linked.
+    assert.ok(await personExists(newPersonId), 'valid person.created must survive the skipped topic.linked');
+  });
 });

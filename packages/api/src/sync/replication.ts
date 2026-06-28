@@ -78,7 +78,8 @@ export async function pushEvents(
     let applied = 0;
     let duplicate = 0;
     let skipped = 0;
-    for (const ev of events) {
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i]!;
       const ins = await client.query(
         `INSERT INTO sync_event
            (id, workspace_id, device_id, entity_type, entity_id, operation, payload, logical_clock, hash)
@@ -101,9 +102,28 @@ export async function pushEvents(
         duplicate++; // already learned of this event — apply was done before
         continue;
       }
-      const result = await applyEvent(client, ev);
-      if (result.applied) applied++;
-      else skipped++;
+      // SAVEPOINT so an unexpected exception inside applyEvent does not abort the
+      // whole batch. applyEvent returns { applied: false } for expected skips
+      // (unknown op, deferred FK, etc.); the catch here handles truly unexpected
+      // errors — it parks the event as skipped and lets the rest of the batch commit
+      // (MIN-984). The sync_event row is kept (outside the savepoint) so peers still
+      // learn about the event even when canonical apply fails.
+      const sp = `ev_${i}`;
+      await client.query(`SAVEPOINT ${sp}`);
+      try {
+        const result = await applyEvent(client, ev);
+        await client.query(`RELEASE SAVEPOINT ${sp}`);
+        if (result.applied) applied++;
+        else skipped++;
+      } catch (applyErr) {
+        await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+        await client.query(`RELEASE SAVEPOINT ${sp}`);
+        console.error(
+          `[sync/push] apply failed for event ${ev.id} (${ev.operation}), parking as skipped:`,
+          applyErr instanceof Error ? applyErr.message : String(applyErr),
+        );
+        skipped++;
+      }
     }
 
     await client.query('COMMIT');
