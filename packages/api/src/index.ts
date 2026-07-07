@@ -13,6 +13,7 @@ import { devicesRouter } from './routes/devices.js';
 import { syncRouter } from './routes/sync.js';
 import { groupsRouter } from './routes/groups.js';
 import { cloudRouter } from './routes/cloud.js';
+import { profileRouter } from './routes/profile.js';
 import { pool } from './db.js';
 
 const app = express();
@@ -40,6 +41,7 @@ app.use('/api/devices', devicesRouter);
 app.use('/api/sync', syncRouter);
 app.use('/api/groups', groupsRouter);
 app.use('/api/cloud', cloudRouter);
+app.use('/api/profile', profileRouter);
 
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);
