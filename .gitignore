@@ -3,6 +3,10 @@ dist
 build
 .env
 .env.local
+
+# Local, private personalization backfill (MIN-1127) — never commit personal data
+*.local.sql
+*.local.json
 .DS_Store
 npm-debug.log
 yarn-error.log
