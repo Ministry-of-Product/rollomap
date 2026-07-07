@@ -349,6 +349,10 @@ export async function pullOnce(): Promise<PullOnceResult> {
             entity_id: local.entity_id,
             operation: local.operation,
             payload: local.payload,
+            // Ordering key for single-row LWW materializers (workspace_profile);
+            // ignored by the plain-overwrite materializers. (MIN-1123)
+            logical_clock: local.logical_clock,
+            server_seq: wireEvent.server_seq,
           });
           if (result.applied) applied++;
           else skipped++;

@@ -134,6 +134,11 @@ const ROUND_TRIP_CASES: ReadonlyArray<{
     entityType: 'person',
     extra: { field_name: 'company', field_value: 'Acme Corp', person_id: uuid() },
   },
+  {
+    localOp: 'profile.updated',
+    entityType: 'workspace_profile',
+    extra: { ownerName: 'Matt', interests: ['ai', 'networking'] },
+  },
 ];
 
 const LOCAL_ONLY_OPS: ReadonlyArray<string> = [

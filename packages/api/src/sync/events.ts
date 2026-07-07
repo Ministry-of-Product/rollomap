@@ -40,6 +40,8 @@ export const SYNC_OPERATIONS = [
   'note.created',
   'interaction.created',
   'field.asserted',
+  // Workspace personalization profile (MIN-1123)
+  'profile.updated',
   // Source connector lifecycle (MIN-937)
   'connection.created',
   'connection.paused',
