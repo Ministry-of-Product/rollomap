@@ -1,0 +1,47 @@
+name: Feature request
+description: Suggest an idea or improvement for RolloMap
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! RolloMap is local-first and privacy-respecting —
+        proposals that keep users in control of their own data fit best.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that's hard or impossible today?
+      placeholder: I'm always frustrated when ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see happen?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any other approaches you've thought about or workarounds you use now.
+    validations:
+      required: false
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which part of RolloMap would this touch?
+      options:
+        - API (packages/api)
+        - MCP server (packages/mcp-server)
+        - Webapp (packages/webapp)
+        - Cloud sync
+        - Ingest
+        - Database / migrations
+        - Docs
+        - Not sure
+    validations:
+      required: false

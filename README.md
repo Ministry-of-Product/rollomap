@@ -1,5 +1,9 @@
 # RolloMap
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 A private, local-first relationship intelligence system. RolloMap ingests
 manually entered or imported text sources (emails, notes, meetings) and builds
 a queryable map of the people in your network. Every claim links back to
@@ -64,6 +68,39 @@ Webapp: <http://localhost:5173> · API: <http://localhost:4000/health>
 npm run db:reset             # drops the volume and re-applies migrations
 npm run seed                 # reload sample data
 ```
+
+## Cloud sync
+
+A local client can run as a local-first replica that pairs to a cloud server
+(`https://rollomap.com`) and replicates its graph both ways. Sync is driven by
+the API: `POST /api/cloud/sync` pushes local changes and pulls peers'. Trigger
+one by hand with:
+
+```bash
+curl -X POST http://localhost:4000/api/cloud/sync
+```
+
+### Always-on auto-sync (macOS)
+
+Nothing syncs on a schedule by default — `POST /api/cloud/sync` only runs when
+called. To push local changes (and pull peers') every 15 minutes hands-free,
+install the launchd agent:
+
+```bash
+ops/sync/install.sh          # installs com.rollomap.sync (runs every 15 min)
+ops/sync/uninstall.sh        # removes it
+```
+
+`install.sh` copies the sync script to `~/.rollomap` and points a launchd agent
+at it. The copy is deliberate: macOS TCC blocks launchd from executing scripts
+under `~/Documents`/`~/Desktop`/`~/Downloads` (`Operation not permitted`), and
+this repo commonly lives under `~/Documents`. Results are logged to
+`~/Library/Logs/rollomap-sync.log`.
+
+**Boot race:** right after a reboot the first tick may fire before the API is
+ready and log `http=000`; the next tick recovers, so the first post-boot sync
+can lag up to ~15 min. Background and rationale: MIN-1130. A cleaner
+API-internal replacement for this agent is tracked in MIN-1131.
 
 ## MCP server
 
@@ -206,6 +243,31 @@ Per the PRD, this is a single-user, single-workspace local setup. There is
 no auth and no cross-workspace aggregation; the schema is workspace-scoped
 end-to-end so multi-tenant isolation can be added later without restructuring.
 
+## Why RolloMap?
+
+Your relationships are among the most valuable things you have, but the memory of
+them is scattered and lossy. Most tools that promise to help do it by uploading
+your contacts and inbox to their servers. RolloMap takes the opposite stance:
+it runs on your machine, against your database, and **you own your data**. Every
+claim links back to source evidence, nothing is aggregated across users, and the
+whole thing is open source so you can verify exactly what it does.
+
+Read more in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md).
+
+## Contributing
+
+Contributions are welcome — bug reports, features, docs, and ideas. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to build and submit changes, and
+[good first issues](https://github.com/Ministry-of-Product/rollomap/labels/good%20first%20issue)
+for a place to start.
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) — report vulnerabilities privately
+- [Discussions](https://github.com/Ministry-of-Product/rollomap/discussions) — questions and ideas
+- [Documentation](docs/README.md)
+
 ## License
 
-Personal use; not yet licensed for distribution.
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 The RolloMap
+Authors. See [NOTICE](NOTICE) for attribution.
