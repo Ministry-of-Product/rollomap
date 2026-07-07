@@ -17,3 +17,6 @@ postgres-data
 *.tsbuildinfo
 __pycache__/
 *.pyc
+
+# Playwright scratch video for screenshots
+scripts/screenshots/.video

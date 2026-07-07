@@ -19,6 +19,16 @@ This repo is the **first local v1**:
 There are no OAuth connectors yet (Gmail/Drive/Calendar come later); v1
 expects manual entry or JSON import.
 
+![RolloMap walkthrough — browsing people, a person profile, topics, and open loops](docs/assets/demo.gif)
+
+<p align="center">
+  <img src="docs/assets/people.png" alt="People directory" width="49%" />
+  <img src="docs/assets/person-profile.png" alt="Person profile with timeline, topics, notes, and open loops" width="49%" />
+</p>
+
+<sub>Screens show synthetic demo data (`db/demo-seed.sql`) — no real people. See
+[`scripts/screenshots/`](scripts/screenshots/) to regenerate.</sub>
+
 ## Layout
 
 ```

@@ -16,7 +16,9 @@
     "mcp:launch": "scripts/launch-mcp.sh",
     "seed": "npm --workspace @rollomap/api run seed",
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "screenshots": "node scripts/screenshots/capture.mjs",
+    "screenshots:gif": "node scripts/screenshots/record.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -29,5 +31,10 @@
   "homepage": "https://github.com/Ministry-of-Product/rollomap#readme",
   "bugs": {
     "url": "https://github.com/Ministry-of-Product/rollomap/issues"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "gifenc": "^1.0.3",
+    "pngjs": "^7.0.0"
   }
 }
