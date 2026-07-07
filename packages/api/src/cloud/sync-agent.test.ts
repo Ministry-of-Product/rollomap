@@ -291,7 +291,7 @@ describe('sync-agent live convergence (:8080)', () => {
     const login = await fetch('http://localhost:8080/auth/dev-login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: 'matt@ministryofproduct.com' }),
+      body: JSON.stringify({ email: 'dev@example.com' }),
     });
     if (!login.ok) return null;
     const cookie = login.headers.get('set-cookie') ?? '';

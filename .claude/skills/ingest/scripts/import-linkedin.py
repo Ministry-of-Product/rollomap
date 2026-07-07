@@ -24,8 +24,13 @@ Adds these defaults on top of merge-csv.py:
   --summary-cols Position "Connected On"
   --how-known "LinkedIn connection (imported <today>)."
   --source-label "LinkedIn export"
-  --skip-email matt@ministryofproduct.com
-  --skip-name "Matt Paulin"
+  --skip-email $INGEST_SKIP_EMAIL (if set)
+  --skip-name $INGEST_SKIP_NAME (if set)
+
+--skip-email/--skip-name default to the INGEST_SKIP_EMAIL / INGEST_SKIP_NAME
+env vars (empty by default) so no personal identity is baked into the
+script — pass them explicitly, or export the env vars, to exclude yourself
+from the import.
 """
 import argparse
 import csv
@@ -102,6 +107,10 @@ def main():
     ap.add_argument("--api", default="http://localhost:4000/api/people")
     ap.add_argument("--how-known",
                     help="Override the default how_known string")
+    ap.add_argument("--skip-email", default=os.environ.get("INGEST_SKIP_EMAIL", ""),
+                    help="Exclude this email from the import (default: $INGEST_SKIP_EMAIL)")
+    ap.add_argument("--skip-name", default=os.environ.get("INGEST_SKIP_NAME", ""),
+                    help="Exclude this display name from the import (default: $INGEST_SKIP_NAME)")
     ap.add_argument("--keep-temp", action="store_true",
                     help="Don't delete the cleaned-CSV temp file (debugging)")
     args = ap.parse_args()
@@ -138,11 +147,13 @@ def main():
             "--summary-cols", "Position", "Connected On",
             "--how-known", how_known,
             "--source-label", "LinkedIn export",
-            "--skip-email", "matt@ministryofproduct.com",
-            "--skip-name", "Matt Paulin",
             "--api", args.api,
             "--log", args.log,
         ]
+        if args.skip_email:
+            cmd += ["--skip-email", args.skip_email]
+        if args.skip_name:
+            cmd += ["--skip-name", args.skip_name]
         if args.dry_run:
             cmd.append("--dry-run")
 

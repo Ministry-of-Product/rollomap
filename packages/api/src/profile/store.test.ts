@@ -53,19 +53,19 @@ describe('workspace profile store', () => {
 
   it('partial update preserves fields not included in the patch', async () => {
     await updateProfile({
-      ownerName: 'Matt Paulin',
+      ownerName: 'Test Owner',
       interests: ['networking'],
-      primaryNetwork: '601 Club',
+      primaryNetwork: 'Test Network',
     });
 
     // Only touch owner_emails this time — owner_name, interests, and
     // primary_network should all survive untouched.
-    const updated = await updateProfile({ ownerEmails: ['matt@example.com'] });
+    const updated = await updateProfile({ ownerEmails: ['owner@example.com'] });
 
-    assert.equal(updated.ownerName, 'Matt Paulin');
+    assert.equal(updated.ownerName, 'Test Owner');
     assert.deepEqual(updated.interests, ['networking']);
-    assert.equal(updated.primaryNetwork, '601 Club');
-    assert.deepEqual(updated.ownerEmails, ['matt@example.com']);
+    assert.equal(updated.primaryNetwork, 'Test Network');
+    assert.deepEqual(updated.ownerEmails, ['owner@example.com']);
   });
 
   it('updateProfile records a profile.updated sync event', async () => {

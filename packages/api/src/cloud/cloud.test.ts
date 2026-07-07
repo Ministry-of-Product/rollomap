@@ -173,7 +173,7 @@ describe('cloudFetch', () => {
       const loginRes = await fetch('http://localhost:8080/auth/dev-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: 'matt@ministryofproduct.com' }),
+        body: JSON.stringify({ email: 'dev@example.com' }),
       });
       if (!loginRes.ok) {
         console.warn('  [skip] dev-login unavailable — revocation 403 test skipped');

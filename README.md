@@ -121,6 +121,8 @@ calling the script directly:
 | `update_person`                 | Edit a person's editable fields (logged as a correction).    |
 | `add_interaction`               | Log a meeting, email summary, or call.                       |
 | `list_topics`                   | List topics with associated person counts.                   |
+| `get_profile`                   | Read the workspace profile (owner identity, interests, import recipes, journal skip-phrases). |
+| `update_profile`                | Update the workspace profile.                                |
 
 All tool calls are scoped to the workspace `WORKSPACE_ID` and never aggregate
 across workspaces (per the PRD's privacy principle).
@@ -147,6 +149,8 @@ full set. Highlights:
 - `POST   /api/query/person-briefing`
 - `POST   /api/query/search`
 - `GET    /api/query/neglected?days=90`
+- `GET    /api/profile`           — read the workspace profile
+- `PUT    /api/profile`           — update the workspace profile
 
 ## Importing data
 
@@ -180,6 +184,21 @@ interaction tied to the imported source.
 - **Open loops** — your pending commitments; mark done / dismiss / reopen
 - **Review** — neglected relationships
 - **Sources** — recent ingested items + JSON importer
+
+## Personalization
+
+Per-workspace personalization (owner identity, interests, saved CSV import
+recipes, and journal skip-phrases used by the ingest skill) lives in the
+`workspace_profile` table, managed via `PUT /api/profile` (REST) or the MCP
+`update_profile` tool — read it back with `GET /api/profile` / `get_profile`.
+Nothing personal is hardcoded in the repo; scripts and skills read
+personalization from the profile at runtime, falling back to generic
+defaults (or the `USER_INTERESTS` / `INGEST_SKIP_EMAIL` / `INGEST_SKIP_NAME`
+env vars — see `.env.example`) when the profile has nothing set. For
+example, `research_person`-style topic-overlap detection is sourced from
+`profile.interests`, and the ingest skill's `extract-dated-interactions.py`
+reads `profile.journalSkipPhrases` to recognize source-specific journal
+section titles to skip.
 
 ## Privacy
 
