@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import 'dotenv/config';
+import './env.js';
 import { peopleRouter } from './routes/people.js';
 import { interactionsRouter } from './routes/interactions.js';
 import { topicsRouter } from './routes/topics.js';
