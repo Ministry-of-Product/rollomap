@@ -12,6 +12,7 @@
  *   Stage 2 — interactions (reference persons via participants)
  *   Stage 3 — notes (reference persons via person_id)
  *   Stage 4 — field assertions (reference persons via person_id)
+ *   Stage 5 — workspace profile (single-row config; no FK deps)
  *
  * ── Idempotency ────────────────────────────────────────────────────────────────
  *   Before emitting, we check sync_event for (workspace_id, entity_id, operation).
@@ -24,6 +25,7 @@
  *     interaction.created → interaction.id
  *     note.created        → note.id
  *     field.asserted      → person_field_assertion.id  (per-assertion)
+ *     profile.updated     → workspace_id               (single-row config)
  *   Re-running emits nothing new.
  *
  * ── SKIPPED (not pushable today) ─────────────────────────────────────────────
@@ -104,6 +106,7 @@ export async function backfillSyncEvents(): Promise<BackfillResult> {
     'interaction.created': { emitted: 0, skipped: 0 },
     'note.created': { emitted: 0, skipped: 0 },
     'field.asserted': { emitted: 0, skipped: 0 },
+    'profile.updated': { emitted: 0, skipped: 0 },
   };
 
   const commitments = await countRows('commitment');
@@ -361,6 +364,51 @@ export async function backfillSyncEvents(): Promise<BackfillResult> {
       cursor = assertions[assertions.length - 1]!.id as string;
       if (assertions.length < BATCH) break;
     }
+  }
+
+  // ── Stage 5: Workspace profile ─────────────────────────────────────────────
+  // Single-row config table (one row per workspace, keyed by workspace_id) with
+  // no FK dependencies. Emit one profile.updated event carrying the full profile
+  // so a freshly-paired device receives the owner's personalization. Idempotent
+  // via hasNoEvent(WORKSPACE_ID, 'profile.updated'). Payload mirrors updateProfile
+  // (camelCase WorkspaceProfile shape) so applyEvent reads it uniformly.
+  {
+    await withSyncTxn(async (client) => {
+      const { rows } = await client.query<Row>(
+        `SELECT owner_name, owner_emails, owner_aliases, interests, primary_network,
+                import_recipes, journal_skip_phrases, metadata,
+                last_event_clock, last_event_seq, created_at, updated_at
+           FROM workspace_profile WHERE workspace_id = $1`,
+        [WORKSPACE_ID],
+      );
+      if (rows.length > 0) {
+        if (await hasNoEvent(client, WORKSPACE_ID, 'profile.updated')) {
+          const r = rows[0]!;
+          await recordEvent(client, {
+            entityType: 'workspace_profile',
+            entityId: WORKSPACE_ID,
+            operation: 'profile.updated',
+            payload: {
+              ownerName: r.owner_name,
+              ownerEmails: r.owner_emails,
+              ownerAliases: r.owner_aliases,
+              interests: r.interests,
+              primaryNetwork: r.primary_network,
+              importRecipes: r.import_recipes,
+              journalSkipPhrases: r.journal_skip_phrases,
+              metadata: r.metadata,
+              lastEventClock: r.last_event_clock,
+              lastEventSeq: r.last_event_seq,
+              createdAt: r.created_at,
+              updatedAt: r.updated_at,
+            },
+          });
+          byOp['profile.updated']!.emitted++;
+        } else {
+          byOp['profile.updated']!.skipped++;
+        }
+      }
+    });
   }
 
   const totals = {

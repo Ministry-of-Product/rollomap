@@ -34,6 +34,18 @@ export interface ApplicableEvent {
   entity_id?: string;
   operation: string;
   payload: unknown;
+  /**
+   * Origin Lamport clock of the event (bigint as string, or number). Used by the
+   * single-row LWW materializers (workspace_profile) to reject stale replays.
+   * Absent when a caller replays an event without an ordering key — such events
+   * are treated as "apply unconditionally", matching the other materializers.
+   */
+  logical_clock?: string | number;
+  /**
+   * Node-local server sequence (from pull). Tiebreaks the LWW comparison when two
+   * events share a logical_clock. Absent for locally-authored / peer-push events.
+   */
+  server_seq?: string | number;
 }
 
 export interface ApplyResult {
@@ -121,6 +133,15 @@ export async function applyEvent(
       // converges on the same winner. resolvePersonRedirect (inside) lands
       // assertions about a merged-away source on the live target.
       return applyFieldAssertion(client, payload);
+
+    case 'profile.updated':
+      // Replay a peer's workspace personalization profile (MIN-1123). The
+      // workspace_profile is a single-row config table keyed by workspace_id
+      // (= event.entity_id). Unlike the other materializers (plain overwrite by
+      // apply order), profile.updated uses a last-writer-wins guard on the
+      // reserved last_event_clock/last_event_seq columns so a stale/re-delivered
+      // event can't regress a newer applied state. See applyProfile.
+      return applyProfile(client, payload, event);
 
     default:
       // Unknown operation — skip safely so newer producers don't break older
@@ -360,5 +381,81 @@ async function applyInteraction(client: QueryableClient, p: Row): Promise<ApplyR
       [(p.workspace_id as string) ?? WORKSPACE_ID, p.id, personId],
     );
   }
+  return { applied: true };
+}
+
+/** Coerce a bigint-ish event field (string | number | undefined) to a param value. */
+function bigintParam(v: string | number | undefined): string | null {
+  return v === undefined || v === null ? null : String(v);
+}
+
+/**
+ * Upsert the single-row workspace_profile from a profile.updated payload (MIN-1123),
+ * keyed by the event's entity_id (= workspace_id). Idempotent + last-writer-wins.
+ *
+ * LWW model: the row's last_event_clock/last_event_seq record the ordering key of
+ * the event that last wrote it. The incoming event's (logical_clock, server_seq)
+ * are compared against them in the ON CONFLICT WHERE guard, so an older/stale or
+ * re-delivered event never overwrites a newer applied state, and applying the same
+ * event twice is a no-op (equal clock/seq ⇒ guard is false).
+ *
+ * NULL handling (deliberate, per MIN-1123): the LOCAL write path (updateProfile)
+ * does NOT stamp last_event_clock/seq, and a caller may replay an event with no
+ * ordering key. In both cases we apply unconditionally (stored NULL, or incoming
+ * NULL ⇒ guard true), matching the other materializers' "remote/last write wins".
+ * The clock guard only arbitrates between two clock-bearing remote events.
+ *
+ * The payload carries the WorkspaceProfile shape recorded by updateProfile
+ * (camelCase keys), NOT snake_case DB columns.
+ */
+async function applyProfile(
+  client: QueryableClient,
+  p: Row,
+  event: ApplicableEvent,
+): Promise<ApplyResult> {
+  const workspaceId = (event.entity_id as string) ?? WORKSPACE_ID;
+  await client.query(
+    `INSERT INTO workspace_profile
+       (workspace_id, owner_name, owner_emails, owner_aliases, interests,
+        primary_network, import_recipes, journal_skip_phrases, metadata,
+        last_event_clock, last_event_seq, created_at, updated_at)
+     VALUES ($1, $2, COALESCE($3::jsonb, '[]'::jsonb), COALESCE($4::jsonb, '[]'::jsonb),
+             COALESCE($5::jsonb, '[]'::jsonb), $6, COALESCE($7::jsonb, '[]'::jsonb),
+             COALESCE($8::jsonb, '[]'::jsonb), COALESCE($9::jsonb, '{}'::jsonb),
+             $10::bigint, $11::bigint,
+             COALESCE($12::timestamptz, now()), COALESCE($13::timestamptz, now()))
+     ON CONFLICT (workspace_id) DO UPDATE SET
+       owner_name           = EXCLUDED.owner_name,
+       owner_emails         = EXCLUDED.owner_emails,
+       owner_aliases        = EXCLUDED.owner_aliases,
+       interests            = EXCLUDED.interests,
+       primary_network      = EXCLUDED.primary_network,
+       import_recipes       = EXCLUDED.import_recipes,
+       journal_skip_phrases = EXCLUDED.journal_skip_phrases,
+       metadata             = EXCLUDED.metadata,
+       last_event_clock     = EXCLUDED.last_event_clock,
+       last_event_seq       = EXCLUDED.last_event_seq
+       -- updated_at is refreshed by the workspace_profile_set_updated_at trigger
+     WHERE workspace_profile.last_event_clock IS NULL
+        OR EXCLUDED.last_event_clock IS NULL
+        OR EXCLUDED.last_event_clock > workspace_profile.last_event_clock
+        OR (EXCLUDED.last_event_clock = workspace_profile.last_event_clock
+            AND COALESCE(EXCLUDED.last_event_seq, 0) > COALESCE(workspace_profile.last_event_seq, 0))`,
+    [
+      workspaceId,
+      p.ownerName ?? null,
+      p.ownerEmails !== undefined ? JSON.stringify(p.ownerEmails) : null,
+      p.ownerAliases !== undefined ? JSON.stringify(p.ownerAliases) : null,
+      p.interests !== undefined ? JSON.stringify(p.interests) : null,
+      p.primaryNetwork ?? null,
+      p.importRecipes !== undefined ? JSON.stringify(p.importRecipes) : null,
+      p.journalSkipPhrases !== undefined ? JSON.stringify(p.journalSkipPhrases) : null,
+      p.metadata !== undefined ? JSON.stringify(p.metadata) : null,
+      bigintParam(event.logical_clock),
+      bigintParam(event.server_seq),
+      p.createdAt ?? null,
+      p.updatedAt ?? null,
+    ],
+  );
   return { applied: true };
 }

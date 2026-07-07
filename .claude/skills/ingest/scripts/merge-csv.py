@@ -18,9 +18,9 @@ Usage example:
         --linkedin-col LinkedIn --org-col Organization \\
         --phone-col Phone \\
         --summary-cols Interests "Why join?" Contribution? Notes \\
-        --how-known "Member of the 601 Club." \\
-        --skip-email matt@ministryofproduct.com \\
-        --skip-name "Matt Paulin" \\
+        --how-known "Member of <your network>." \\
+        --skip-email you@example.com \\
+        --skip-name "Your Name" \\
         --api http://localhost:4000/api/people \\
         --log /tmp/merge_log.json
 """

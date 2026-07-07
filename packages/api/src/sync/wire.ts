@@ -28,6 +28,7 @@
  *   note.created          note.created          note → note
  *   interaction.created   interaction.created   interaction → interaction
  *   field.asserted        assertion.added       person → assertion
+ *   profile.updated       profile.updated       workspace_profile → profile
  *
  * ── LOCAL-ONLY ops (not pushed to cloud; cloud wire format cannot represent them)
  *
@@ -61,6 +62,7 @@ export const WIRE_ENTITY_TYPES = [
   'commitment',
   'identity',
   'assertion',
+  'profile',
 ] as const;
 export type WireEntityType = (typeof WIRE_ENTITY_TYPES)[number];
 
@@ -97,6 +99,8 @@ export const WIRE_OPS = [
   'commitment.deleted',
   // field-level provenance
   'assertion.added',
+  // workspace personalization profile (single-row config; MIN-1123)
+  'profile.updated',
 ] as const;
 export type WireOp = (typeof WIRE_OPS)[number];
 
@@ -309,6 +313,19 @@ const OP_TABLE: Readonly<Record<string, OpEntry>> = {
     wireOp: 'assertion.added',
     wireEntityType: 'assertion',
     localEntityType: 'person',
+  },
+  /**
+   * profile.updated → profile.updated (MIN-1123)
+   * The workspace_profile single-row config table. Local entity_type is the DB
+   * table name 'workspace_profile'; on the wire the entity_type is 'profile'.
+   * entity_id is the workspace_id and passes through unchanged; fromWireEvent
+   * restores entity_type='workspace_profile' for a lossless round-trip.
+   */
+  'profile.updated': {
+    pushable: true,
+    wireOp: 'profile.updated',
+    wireEntityType: 'profile',
+    localEntityType: 'workspace_profile',
   },
 
   // ── LOCAL-ONLY ops ──────────────────────────────────────────────────────────

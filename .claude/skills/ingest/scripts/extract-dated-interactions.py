@@ -6,12 +6,12 @@ write them to RolloMap as `interaction` rows linked to participants.
 Designed for retrospective books / meeting journals where each meeting has a
 header like:
 
-    Feb 16, 2015: Brian Hilgendorf
-    March 7, 2015: Robin Elenga
-    Feb 25, 2015: Jim Judson + John Bredvik
-    October 21, 2015: Jim Judson, Joe Wallin
-    August 27, 2015: Eddie O'Brien (Arvato)
-    July 30, 2015: Met with Greg @ Artifact
+    Feb 16, 2015: Alex Rivera
+    March 7, 2015: Jamie Torres
+    Feb 25, 2015: Sam Chen + Jordan Lee
+    October 21, 2015: Sam Chen, Taylor Brooks
+    August 27, 2015: Morgan Diaz (Acme Corp)
+    July 30, 2015: Met with Casey @ Example Inc
 
 The script:
   1. Finds all section headers matching `<Month> <Day>, <Year>: <Attendee(s)>`.
@@ -27,22 +27,23 @@ The script:
      in MCP, but the REST route stores them in the `topics` JSONB column).
 
 Skips:
-  - Headers with no attendee suffix (pure-Matt journal entries, e.g.
-    `January 5, 2015`).
+  - Headers with no attendee suffix (pure-journal entries with no attendee,
+    e.g. `January 5, 2015`).
   - Retrospective sections explicitly marked (e.g. `"Retrospect"`,
     `"retrospection"`, `"Retrospective"`).
   - Headers whose attendee field is a generic noun ("Cap Table", "Minutes",
-    "Funders Club", "Pitch Clinic", etc.) — those are added by --skip-attendees.
+    "Pitch Clinic", etc.) — those are added by --skip-attendees, or come from
+    the workspace profile's `journalSkipPhrases` (see fetch_skip_phrases()).
 
 Usage:
     extract-dated-interactions.py <text-file> \\
-        --topic zCrowd \\
-        --source-label "zCrowd fundraising" \\
+        --topic Fundraising \\
+        --source-label "seed round" \\
         --interaction-type meeting \\
         --log /tmp/interactions_log.json \\
         [--api http://localhost:4000/api] \\
         [--dry-run] \\
-        [--skip-attendee Geoff] [--skip-attendee Funders Club] ...
+        [--skip-attendee Geoff] [--skip-attendee "Cap Table"] ...
 """
 import argparse, json, re, sys, urllib.error, urllib.request
 from datetime import datetime, timezone
@@ -65,7 +66,7 @@ NAME_STRIP_PATTERNS = [
     re.compile(r"^Meeting with\s+", re.I),
     re.compile(r"\s+Meeting$", re.I),
     re.compile(r"\s+\(.*\)$"),          # trailing "(Arvato)" / "(He/Him)"
-    re.compile(r"\s+@\s+.*$"),          # "Greg @ Artifact" → "Greg"
+    re.compile(r"\s+@\s+.*$"),          # "Casey @ Example Inc" → "Casey"
     re.compile(r"\s+of\s+[A-Z].*$"),    # "Diego of Algorithmia" → "Diego"
     re.compile(r"\s+(eDiscovery|Pitch|Talk|Call|Retrospective|Retrospection|Retrospect|"
                r"Meeting)\s+expert.*$", re.I),
@@ -75,20 +76,17 @@ NAME_STRIP_PATTERNS = [
 ]
 
 # If the original `rest` matches one of these patterns, skip the whole header —
-# it's a Matt-only journal section, retrospective, or event title (no attendees).
+# it's a journal-author-only section, retrospective, or event title (no
+# attendees). Kept intentionally small and generic (universal business-
+# meeting/journal nouns only); source-specific titles belong in the
+# workspace profile's `journalSkipPhrases` field (see fetch_skip_phrases()),
+# not hardcoded here.
 NON_PERSON_REST_PATTERNS = [
-    re.compile(r"\b(Conference|Clinic|Trifecta|Plan Review|Disaster|Norms|"
+    re.compile(r"\b(Conference|Clinic|Pitch Clinic|Plan Review|"
                r"Retrospect|Retrospection|Retrospective|"
-               r"Cap Table|Minutes|Funders Club|Beer and Angels|"
+               r"Cap Table|Minutes|"
                r"Sales pain|pain point|"
-               r"Never sent|Thoughts for|Shutdown email|Time to end|"
-               r"Self Eval|personal journal|Evaluation and decisions|"
-               r"CEO Steps|Pitch Clinic|AoA Pitch|"
-               r"response with|"
-               r"BeyondSoft with|"
-               r"Razzle Dazzle|"
-               r"have a choice|"
-               r"continuing forward)\b", re.I),
+               r"Self Eval|personal journal|Evaluation and decisions)\b", re.I),
 ]
 
 # A candidate name must look like a real person — every token starts with an
@@ -117,13 +115,24 @@ def parse_header(line):
     return {"date": dt, "rest": rest, "raw": line.strip()}
 
 
-def split_attendees(rest, skip_attendees):
-    """Return a list of cleaned candidate person names from the suffix."""
+def split_attendees(rest, skip_attendees, skip_phrases=()):
+    """Return a list of cleaned candidate person names from the suffix.
+
+    `skip_attendees` (from --skip-attendee) match by EQUALITY — real attendee
+    names / exact titles. `skip_phrases` (from the workspace profile's
+    journalSkipPhrases) match as case-insensitive SUBSTRINGS of the header suffix:
+    they replace the old hardcoded substring regexes, so a profile phrase like
+    "Funders Club" still skips a header suffix "Funders Club Pitch Night".
+    """
     if not rest:
         return []
-    # Skip the whole header if the original rest matches an event/journal pattern
+    # Skip the whole header if the original rest exactly matches a skip attendee.
     skip_lower = {a.lower() for a in skip_attendees}
-    if rest.lower() in skip_lower:
+    rest_lower = rest.lower()
+    if rest_lower in skip_lower:
+        return []
+    # Profile-sourced phrases are substring matches (see docstring).
+    if any(ph in rest_lower for ph in (p.lower() for p in skip_phrases if p)):
         return []
     if any(p.search(rest) for p in NON_PERSON_REST_PATTERNS):
         return []
@@ -155,6 +164,24 @@ def split_attendees(rest, skip_attendees):
 def fetch_db_people(api):
     with urllib.request.urlopen(f"{api}/people?limit=500", timeout=10) as r:
         return json.loads(r.read())["people"]
+
+
+def fetch_skip_phrases(api):
+    """Best-effort fetch of the workspace profile's `journalSkipPhrases`.
+
+    Personal / source-specific journal section titles (things like a
+    particular deal-flow group's name, or a one-off "never sent" entry)
+    live in the owner's profile rather than hardcoded here. If the API is
+    unreachable or the profile has none set, fall back to an empty list —
+    callers union this with the small generic default and any
+    --skip-attendee values, so a fetch failure never breaks the script.
+    """
+    try:
+        with urllib.request.urlopen(f"{api}/profile", timeout=10) as r:
+            profile = json.loads(r.read())["profile"]
+        return [p for p in (profile.get("journalSkipPhrases") or []) if p]
+    except Exception:
+        return []
 
 
 def http_json(method, url, body=None):
@@ -244,6 +271,11 @@ def main():
     db = fetch_db_people(args.api)
     lookups = build_lookups(db)
 
+    # --skip-attendee values (CLI, EXACT match) are kept separate from the profile's
+    # journalSkipPhrases (best-effort, SUBSTRING match) — see split_attendees().
+    skip_attendees = list(args.skip_attendee)
+    skip_phrases = fetch_skip_phrases(args.api)
+
     log = {
         "source_file": args.text_file,
         "source_label": args.source_label,
@@ -257,7 +289,7 @@ def main():
 
     for idx, sec in enumerate(sections[:-1]):
         h = sec["header"]
-        attendees = split_attendees(h["rest"], args.skip_attendee)
+        attendees = split_attendees(h["rest"], skip_attendees, skip_phrases)
         if not attendees:
             log["skipped"].append({
                 "raw_header": h["raw"],

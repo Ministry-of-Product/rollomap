@@ -4,6 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { pool, query, WORKSPACE_ID, tsQuery } from './db.js';
 import { recordEvent, withSyncTxn } from './sync-events.js';
+import { getProfile, updateProfile, getInterests, type WorkspaceProfilePatch } from './profile.js';
 
 const server = new McpServer({
   name: 'rollomap',
@@ -514,23 +515,13 @@ server.tool(
   },
 );
 
-// Matt's known interests / focus areas — used to flag overlaps during research.
-// Source: project memory + zCrowd/Pugetworks/CBRE history. Update as needed.
-const MATT_INTERESTS = [
-  'product management', 'OKRs', 'AI in education', 'machine learning',
-  'startups', 'fundraising', 'crowdsourcing', 'modded Minecraft',
-  'community building', 'Seattle tech', 'consulting',
-  'commercial real estate', 'EdTech', 'product leadership',
-  'electrical engineering', 'team building',
-];
-
 // ------- research_person -------
 // PREP step: resolves the target, returns context the agent needs to synthesize.
 // The agent (Claude) uses its own WebFetch on linkedin_url + any public sources,
 // or asks the user to paste profile text, then calls save_person_research.
 server.tool(
   'research_person',
-  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), Matt\'s known interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research.',
+  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research.',
   {
     linkedin_url: z.string().url().optional().describe('LinkedIn profile URL — preferred way to identify someone.'),
     person_id: z.string().uuid().optional(),
@@ -620,6 +611,8 @@ server.tool(
       [pid],
     );
 
+    const userInterests = await getInterests();
+
     return ok({
       person: {
         id: pid,
@@ -641,13 +634,13 @@ server.tool(
       recent_interactions: interactionsRes.rows,
       prior_deep_dives: deepDivesRes.rows,
       notes: notesRes.rows,
-      matt_interests: MATT_INTERESTS,
+      user_interests: userInterests,
       synthesis_instructions: [
         '1. Use WebFetch to retrieve the linkedin_url if present. If LinkedIn returns a login wall or sparse content, ask the user to paste the profile text.',
         '2. Optionally search for and fetch additional sources: personal site (often linked from the LinkedIn profile), Substack/Medium blog, Twitter/X, GitHub for technical folks, podcast/talk transcripts.',
         '3. Synthesize a 2-3 paragraph Deep Dive synopsis: current focus, expertise/track record, what they\'re publicly thinking about lately.',
         '4. Extract 5-15 topics that describe their expertise/interests. Use lowercase canonical forms (e.g. "fintech" not "FinTech").',
-        '5. Compute overlap: which of their topics intersect with matt_interests? List those as overlap_topics.',
+        '5. Compute overlap: which of their topics intersect with the user\'s configured interests? List those as overlap_topics.',
         '6. Call save_person_research with person_id, synopsis, topics (with confidence 0.5-1.0), overlap_topics, and sources (URLs of what you actually fetched). It will be appended as a dated Deep Dive entry — prior entries are preserved.',
         'If the prior_deep_dives array is non-empty, treat this as a NEW dated entry: write a fresh synopsis that captures what is true now, noting any visible changes from the prior entries. Do not duplicate language verbatim.',
       ],
@@ -666,7 +659,7 @@ server.tool(
       name: z.string().min(1),
       confidence: z.number().min(0).max(1).default(0.7),
     })).default([]).describe('Topics describing the person\'s expertise/interests. Use lowercase canonical names.'),
-    overlap_topics: z.array(z.string()).default([]).describe('Subset of topics that overlap with Matt\'s known interests — gets confidence 1.0 and user_confirmed=true.'),
+    overlap_topics: z.array(z.string()).default([]).describe('Subset of topics that overlap with the user\'s configured interests — gets confidence 1.0 and user_confirmed=true.'),
     sources: z.array(z.string()).default([]).describe('URLs / labels of sources actually used to write the synopsis (LinkedIn profile, blog post URLs, etc.).'),
   },
   async ({ person_id, synopsis, topics, overlap_topics, sources }) => {
@@ -686,7 +679,7 @@ server.tool(
 
       // Build the Deep Dive note body — clean markdown, no marker.
       // Sources and overlap rendered as trailing blocks for readability.
-      const overlapBlock = overlap_topics.length ? `\n\n**Overlap with Matt:** ${overlap_topics.join(', ')}` : '';
+      const overlapBlock = overlap_topics.length ? `\n\n**Overlap with your interests:** ${overlap_topics.join(', ')}` : '';
       const sourcesBlock = sources.length ? `\n\n**Sources:**\n${sources.map(s => `- ${s}`).join('\n')}` : '';
       const noteBody = `${synopsis}${overlapBlock}${sourcesBlock}`;
 
@@ -780,6 +773,49 @@ server.tool(
     } finally {
       client.release();
     }
+  },
+);
+
+// ------- get_profile -------
+server.tool(
+  'get_profile',
+  'Return the user\'s own workspace profile: name, emails, aliases, configured interests, primary network, import recipes, journal skip phrases, and metadata. Use this to personalize behavior (e.g. research overlap detection, filtering the user\'s own emails out of contact lists).',
+  {},
+  async () => {
+    const profile = await getProfile();
+    return ok({ profile });
+  },
+);
+
+// ------- update_profile -------
+server.tool(
+  'update_profile',
+  'Update the user\'s own workspace profile. Partial update — only the fields provided are changed, everything else is left as-is. Use this to let the user manage their personalization settings conversationally (e.g. "my name is ...", "add edtech to my interests", "here\'s a phrase to skip when journaling").',
+  {
+    owner_name: z.string().nullable().optional().describe('The user\'s own display name.'),
+    owner_emails: z.array(z.string()).optional().describe('The user\'s own email addresses.'),
+    owner_aliases: z.array(z.string()).optional().describe('Other names/aliases the user goes by.'),
+    interests: z.array(z.string()).optional().describe('The user\'s configured interest areas, used for research overlap detection.'),
+    primary_network: z.string().nullable().optional().describe('The user\'s primary network or community (e.g. an org or group name).'),
+    import_recipes: z.array(z.record(z.unknown())).optional().describe('Saved import recipe configs (arbitrary objects) for recurring ingest sources.'),
+    journal_skip_phrases: z.array(z.string()).optional().describe('Phrases that mark journal content the user wants skipped/ignored during ingest.'),
+    metadata: z.record(z.unknown()).optional().describe('Free-form additional profile metadata.'),
+  },
+  async (args) => {
+    // Forward ONLY the keys the caller actually provided, so updateProfile can
+    // distinguish explicit-null (clear owner_name/primary_network) from omitted
+    // (keep existing). zod drops absent optional keys, so `... in args` is honest.
+    const patch: WorkspaceProfilePatch = {};
+    if ('owner_name' in args) patch.ownerName = args.owner_name;
+    if ('owner_emails' in args) patch.ownerEmails = args.owner_emails;
+    if ('owner_aliases' in args) patch.ownerAliases = args.owner_aliases;
+    if ('interests' in args) patch.interests = args.interests;
+    if ('primary_network' in args) patch.primaryNetwork = args.primary_network;
+    if ('import_recipes' in args) patch.importRecipes = args.import_recipes as Record<string, unknown>[] | undefined;
+    if ('journal_skip_phrases' in args) patch.journalSkipPhrases = args.journal_skip_phrases;
+    if ('metadata' in args) patch.metadata = args.metadata as Record<string, unknown> | undefined;
+    const profile = await updateProfile(patch);
+    return ok({ profile });
   },
 );
 
