@@ -137,7 +137,7 @@ const ROUND_TRIP_CASES: ReadonlyArray<{
   {
     localOp: 'profile.updated',
     entityType: 'workspace_profile',
-    extra: { ownerName: 'Matt', interests: ['ai', 'networking'] },
+    extra: { ownerName: 'Test Owner', interests: ['ai', 'networking'] },
   },
 ];
 

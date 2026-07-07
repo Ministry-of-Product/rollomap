@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { pool, query, WORKSPACE_ID, tsQuery } from './db.js';
 import { recordEvent, withSyncTxn } from './sync-events.js';
-import { getProfile, updateProfile, getInterests } from './profile.js';
+import { getProfile, updateProfile, getInterests, type WorkspaceProfilePatch } from './profile.js';
 
 const server = new McpServer({
   name: 'rollomap',
@@ -801,17 +801,20 @@ server.tool(
     journal_skip_phrases: z.array(z.string()).optional().describe('Phrases that mark journal content the user wants skipped/ignored during ingest.'),
     metadata: z.record(z.unknown()).optional().describe('Free-form additional profile metadata.'),
   },
-  async ({ owner_name, owner_emails, owner_aliases, interests, primary_network, import_recipes, journal_skip_phrases, metadata }) => {
-    const profile = await updateProfile({
-      ownerName: owner_name,
-      ownerEmails: owner_emails,
-      ownerAliases: owner_aliases,
-      interests,
-      primaryNetwork: primary_network,
-      importRecipes: import_recipes as Record<string, unknown>[] | undefined,
-      journalSkipPhrases: journal_skip_phrases,
-      metadata: metadata as Record<string, unknown> | undefined,
-    });
+  async (args) => {
+    // Forward ONLY the keys the caller actually provided, so updateProfile can
+    // distinguish explicit-null (clear owner_name/primary_network) from omitted
+    // (keep existing). zod drops absent optional keys, so `... in args` is honest.
+    const patch: WorkspaceProfilePatch = {};
+    if ('owner_name' in args) patch.ownerName = args.owner_name;
+    if ('owner_emails' in args) patch.ownerEmails = args.owner_emails;
+    if ('owner_aliases' in args) patch.ownerAliases = args.owner_aliases;
+    if ('interests' in args) patch.interests = args.interests;
+    if ('primary_network' in args) patch.primaryNetwork = args.primary_network;
+    if ('import_recipes' in args) patch.importRecipes = args.import_recipes as Record<string, unknown>[] | undefined;
+    if ('journal_skip_phrases' in args) patch.journalSkipPhrases = args.journal_skip_phrases;
+    if ('metadata' in args) patch.metadata = args.metadata as Record<string, unknown> | undefined;
+    const profile = await updateProfile(patch);
     return ok({ profile });
   },
 );

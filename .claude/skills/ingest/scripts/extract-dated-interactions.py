@@ -115,13 +115,24 @@ def parse_header(line):
     return {"date": dt, "rest": rest, "raw": line.strip()}
 
 
-def split_attendees(rest, skip_attendees):
-    """Return a list of cleaned candidate person names from the suffix."""
+def split_attendees(rest, skip_attendees, skip_phrases=()):
+    """Return a list of cleaned candidate person names from the suffix.
+
+    `skip_attendees` (from --skip-attendee) match by EQUALITY — real attendee
+    names / exact titles. `skip_phrases` (from the workspace profile's
+    journalSkipPhrases) match as case-insensitive SUBSTRINGS of the header suffix:
+    they replace the old hardcoded substring regexes, so a profile phrase like
+    "Funders Club" still skips a header suffix "Funders Club Pitch Night".
+    """
     if not rest:
         return []
-    # Skip the whole header if the original rest matches an event/journal pattern
+    # Skip the whole header if the original rest exactly matches a skip attendee.
     skip_lower = {a.lower() for a in skip_attendees}
-    if rest.lower() in skip_lower:
+    rest_lower = rest.lower()
+    if rest_lower in skip_lower:
+        return []
+    # Profile-sourced phrases are substring matches (see docstring).
+    if any(ph in rest_lower for ph in (p.lower() for p in skip_phrases if p)):
         return []
     if any(p.search(rest) for p in NON_PERSON_REST_PATTERNS):
         return []
@@ -260,8 +271,10 @@ def main():
     db = fetch_db_people(args.api)
     lookups = build_lookups(db)
 
-    # Union: --skip-attendee values (CLI) + journalSkipPhrases (profile, best-effort)
-    skip_attendees = list(args.skip_attendee) + fetch_skip_phrases(args.api)
+    # --skip-attendee values (CLI, EXACT match) are kept separate from the profile's
+    # journalSkipPhrases (best-effort, SUBSTRING match) — see split_attendees().
+    skip_attendees = list(args.skip_attendee)
+    skip_phrases = fetch_skip_phrases(args.api)
 
     log = {
         "source_file": args.text_file,
@@ -276,7 +289,7 @@ def main():
 
     for idx, sec in enumerate(sections[:-1]):
         h = sec["header"]
-        attendees = split_attendees(h["rest"], skip_attendees)
+        attendees = split_attendees(h["rest"], skip_attendees, skip_phrases)
         if not attendees:
             log["skipped"].append({
                 "raw_header": h["raw"],

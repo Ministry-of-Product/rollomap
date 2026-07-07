@@ -108,6 +108,12 @@ export async function getProfile(): Promise<WorkspaceProfile> {
  * row in the same transaction as the write.
  */
 export async function updateProfile(patch: WorkspaceProfilePatch): Promise<WorkspaceProfile> {
+  // Distinguish explicit-null (clear the column) from omitted (keep existing) for
+  // the nullable scalar columns. The `... in patch` check is honest because the
+  // route/tool forward only the keys the caller actually provided. The jsonb/array
+  // columns can't be "cleared to null" (they default to []/{}); passing [] clears them.
+  const ownerNameProvided = 'ownerName' in patch;
+  const primaryNetworkProvided = 'primaryNetwork' in patch;
   return withSyncTxn(async (client) => {
     const result = await client.query<WorkspaceProfileRow>(
       `INSERT INTO workspace_profile
@@ -117,11 +123,11 @@ export async function updateProfile(patch: WorkspaceProfilePatch): Promise<Works
                COALESCE($5::jsonb, '[]'::jsonb), $6, COALESCE($7::jsonb, '[]'::jsonb),
                COALESCE($8::jsonb, '[]'::jsonb), COALESCE($9::jsonb, '{}'::jsonb), now())
        ON CONFLICT (workspace_id) DO UPDATE
-         SET owner_name           = COALESCE($2, workspace_profile.owner_name),
+         SET owner_name           = CASE WHEN $10::boolean THEN $2 ELSE workspace_profile.owner_name END,
              owner_emails         = COALESCE($3::jsonb, workspace_profile.owner_emails),
              owner_aliases        = COALESCE($4::jsonb, workspace_profile.owner_aliases),
              interests            = COALESCE($5::jsonb, workspace_profile.interests),
-             primary_network      = COALESCE($6, workspace_profile.primary_network),
+             primary_network      = CASE WHEN $11::boolean THEN $6 ELSE workspace_profile.primary_network END,
              import_recipes       = COALESCE($7::jsonb, workspace_profile.import_recipes),
              journal_skip_phrases = COALESCE($8::jsonb, workspace_profile.journal_skip_phrases),
              metadata             = COALESCE($9::jsonb, workspace_profile.metadata),
@@ -139,15 +145,31 @@ export async function updateProfile(patch: WorkspaceProfilePatch): Promise<Works
         patch.importRecipes !== undefined ? JSON.stringify(patch.importRecipes) : null,
         patch.journalSkipPhrases !== undefined ? JSON.stringify(patch.journalSkipPhrases) : null,
         patch.metadata !== undefined ? JSON.stringify(patch.metadata) : null,
+        ownerNameProvided,
+        primaryNetworkProvided,
       ],
     );
     const profile = mapRow(result.rows[0]!);
-    await recordEvent(client, {
+    const event = await recordEvent(client, {
       entityType: 'workspace_profile',
       entityId: WORKSPACE_ID,
       operation: 'profile.updated',
       payload: profile,
     });
+    // LWW stamp (MIN-1122): record the ordering key of THIS local write on the row
+    // so a later stale remote profile.updated (lower clock) can't clobber it in
+    // applyProfile's guard. Without this the stored clock stays NULL and the guard
+    // applies unconditionally, letting two devices swap+diverge permanently.
+    // last_event_seq is NULL for a locally-authored write (server_seq is assigned
+    // only on pull). Idempotent: re-running with the same recorded clock is a no-op.
+    await client.query(
+      `UPDATE workspace_profile
+          SET last_event_clock = $2::bigint, last_event_seq = NULL
+        WHERE workspace_id = $1`,
+      [WORKSPACE_ID, event.logical_clock],
+    );
+    profile.lastEventClock = event.logical_clock;
+    profile.lastEventSeq = null;
     return profile;
   });
 }

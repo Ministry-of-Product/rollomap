@@ -6,16 +6,29 @@
  *   (a) a remote profile.updated event upserts the single-row workspace_profile;
  *   (b) idempotency — replaying the SAME event twice is a no-op;
  *   (c) last-writer-wins — a stale (lower clock) event does NOT overwrite a newer
- *       applied state, and a newer event does.
+ *       applied state, and a newer event does;
+ *   (d) convergence — a local write (high clock) is not clobbered by a stale remote
+ *       (low clock), and BOTH apply orderings agree on the same winner.
  *
- * The wire round-trip case (d) lives in wire.test.ts alongside the other ops.
+ * ISOLATION: this suite operates on its OWN throwaway workspace (a fresh uuid,
+ * inserted in before() and dropped in after()), NOT the default WORKSPACE_ID. The
+ * workspace_profile is a single row keyed by workspace_id, and `node --test` runs
+ * test files concurrently against one shared rollomap_test DB. store.test.ts owns
+ * the default WORKSPACE_ID row; keeping this file on a dedicated workspace means the
+ * two suites never race on the same row. applyProfile keys the row by the event's
+ * entity_id (= workspace_id), so a synthetic workspace id flows through end-to-end.
+ *
+ * The wire round-trip case lives in wire.test.ts alongside the other ops.
  */
 
-import { describe, it, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { pool, WORKSPACE_ID } from '../db.js';
+import { pool } from '../db.js';
 import { applyEvent, type ApplicableEvent } from './apply.js';
+
+// Dedicated throwaway workspace for this file (see ISOLATION note above).
+const WS = crypto.randomUUID();
 
 /** Build a remote profile.updated event with the given clock and payload fields. */
 function profileEvent(
@@ -27,7 +40,7 @@ function profileEvent(
     id: crypto.randomUUID(),
     device_id: crypto.randomUUID(),
     entity_type: 'workspace_profile',
-    entity_id: WORKSPACE_ID,
+    entity_id: WS,
     operation: 'profile.updated',
     payload,
     logical_clock: clock,
@@ -44,19 +57,28 @@ async function readProfile(): Promise<{
   const { rows } = await pool.query(
     `SELECT owner_name, interests, last_event_clock, last_event_seq
        FROM workspace_profile WHERE workspace_id = $1`,
-    [WORKSPACE_ID],
+    [WS],
   );
   return rows[0] ?? null;
 }
 
 describe('workspace_profile sync apply (MIN-1123)', () => {
+  before(async () => {
+    // A workspace row must exist for the workspace_profile FK.
+    await pool.query(
+      `INSERT INTO workspace (id, name) VALUES ($1, 'profile-sync-test') ON CONFLICT (id) DO NOTHING`,
+      [WS],
+    );
+  });
+
   beforeEach(async () => {
     // Start each case from no profile row (single-row config table).
-    await pool.query(`DELETE FROM workspace_profile WHERE workspace_id = $1`, [WORKSPACE_ID]);
+    await pool.query(`DELETE FROM workspace_profile WHERE workspace_id = $1`, [WS]);
   });
 
   after(async () => {
-    await pool.query(`DELETE FROM workspace_profile WHERE workspace_id = $1`, [WORKSPACE_ID]);
+    await pool.query(`DELETE FROM workspace_profile WHERE workspace_id = $1`, [WS]);
+    await pool.query(`DELETE FROM workspace WHERE id = $1`, [WS]);
     await pool.end();
   });
 
@@ -133,5 +155,24 @@ describe('workspace_profile sync apply (MIN-1123)', () => {
     row = await readProfile();
     assert.equal(row!.owner_name, 'HigherSeq');
     assert.equal(row!.last_event_seq, '300');
+  });
+
+  it('(d) convergence — a stale remote cannot clobber a higher-clock write; both orderings agree', async () => {
+    // "A-local" reproduces exactly the row a local updateProfile write now leaves
+    // behind after BLOCKER 2's fix: its own state, stamped with a high clock (100).
+    await applyEvent(pool, profileEvent(100, { ownerName: 'A-local', interests: ['a'] }));
+    // A stale remote event from device B (clock 5) must NOT clobber it.
+    await applyEvent(pool, profileEvent(5, { ownerName: 'B-stale', interests: ['b'] }));
+    let row = await readProfile();
+    assert.equal(row!.owner_name, 'A-local', 'stale remote did not clobber the higher-clock write');
+    assert.equal(row!.last_event_clock, '100');
+
+    // Reverse ordering on a fresh row must converge to the SAME winner (A, clock 100).
+    await pool.query(`DELETE FROM workspace_profile WHERE workspace_id = $1`, [WS]);
+    await applyEvent(pool, profileEvent(5, { ownerName: 'B-stale', interests: ['b'] }));
+    await applyEvent(pool, profileEvent(100, { ownerName: 'A-local', interests: ['a'] }));
+    row = await readProfile();
+    assert.equal(row!.owner_name, 'A-local', 'reverse ordering converges to the same winner');
+    assert.equal(row!.last_event_clock, '100');
   });
 });
