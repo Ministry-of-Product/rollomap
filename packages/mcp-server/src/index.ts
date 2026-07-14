@@ -77,7 +77,7 @@ server.tool(
   },
   async ({ query: q, limit }) => {
     const result = await query(
-      `SELECT id, display_name, primary_email, company, title, summary, last_seen_at, relationship_strength
+      `SELECT id, display_name, primary_email, company, title, summary, last_seen_at, relationship_strength, known_phones
          FROM person
         WHERE workspace_id = $1
           AND (tsv @@ plainto_tsquery('english', $2)
@@ -149,6 +149,13 @@ server.tool(
       last_seen_at: person.last_seen_at,
       first_seen_at: person.first_seen_at,
       interaction_count: person.interaction_count,
+      contact: {
+        primary_email: person.primary_email,
+        known_emails: person.known_emails,
+        known_phones: person.known_phones,
+        linkedin_url: person.linkedin_url,
+        aliases: person.aliases,
+      },
       topics: topics.rows,
       open_loops: openLoops.rows,
       user_notes: notes.rows,
