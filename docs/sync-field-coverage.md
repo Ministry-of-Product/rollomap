@@ -63,7 +63,7 @@ Person **delete** (`person.deleted`) and **merge** (`person.merged`) also replic
 | Identity | `identity.added` | `identity_type`→`kind`, `identity_value`→`value`, `confidence`, `verified_by_user` |
 | Topic | `topic.created` | `name`, `aliases`, `description`, `parent_topic_id` |
 | Person↔Topic link | `topic.linked` | `topic_id`, `confidence`, `user_confirmed` |
-| Note | `note.created` | `body`, `kind`, `person_id` |
+| Note | `note.created`, `note.archived` | `body`, `kind`, `person_id`, `archived_at` (soft-archive; `note.archived`→wire `note.deleted`) |
 | Interaction | `interaction.created` | `title`, `summary`, `body`, `occurred_at`, `topics`, `sensitivity_level`, `confidence`, `interaction_type`→`channel`, `participant_ids`→`participants` |
 | Workspace profile | `profile.updated` | `owner_name`, `owner_emails`, `owner_aliases`, `interests`, `primary_network`, `import_recipes`, `journal_skip_phrases`, `metadata` |
 
@@ -96,14 +96,14 @@ indirectly — but the column values themselves are not replicated.
 There is a local op for **create** (and, for people, update) but **not** for
 later edits/deletes, so these silently stay local:
 
-- **Editing or deleting a note** (`note.updated` / `note.deleted`)
 - **Editing or deleting an interaction** (`interaction.updated` / `interaction.deleted`)
 - **Removing an identity** (`identity.removed`)
 - **Unlinking a topic** (`topic.unlinked`)
 
-> A *new* note/interaction/identity/topic-link replicates; **changing or removing
-> one afterward does not.** People are the exception — person edits (`person.updated`)
-> do sync.
+> A *new* interaction/identity/topic-link replicates; **changing or removing
+> one afterward does not.** Two exceptions: person edits (`person.updated`) sync,
+> and note archival (`note.archived`) syncs — notes are immutable + archivable, so
+> there is no note-edit case at all (see gap #1 below, now implemented).
 
 ---
 
@@ -112,20 +112,20 @@ later edits/deletes, so these silently stay local:
 These are rough edges where current behavior is likely to confuse users. Not yet
 implemented — captured here so the design intent is on record.
 
-### 1. Notes should be immutable + archivable (replaces silent edit failure)
+### 1. Notes are immutable + archivable ✅ IMPLEMENTED (migration 015)
 
-**Problem:** editing a note looks like it works locally but never replicates
-(`note.updated` has no local op).
+Notes have no edit endpoint (already append-only). "Deleting" a note now
+**soft-archives** it (`note.archived_at`) instead of hard-deleting the row — the
+old `DELETE` recorded no sync event and lost the row locally. The archive records
+a `note.archived` local op that maps to the existing `note.deleted` wire
+tombstone, so **it replicates within the existing protocol — no wire-contract
+change**. `applyEvent` replays it as a soft-archive (never a hard delete). Reads
+(`GET /notes`, person profile, MCP briefs, search, stats) exclude archived notes
+by default; `GET /notes?include_archived=1` returns them. Backfill preserves an
+already-archived note's state so a fresh backfill won't resurrect it on peers.
 
-**Proposed:** make notes append-only. Remove edit; to "change" a note you
-**archive** it (set `archived_at`) and write a new one. Archive maps to the
-existing `note.deleted` tombstone wire op, so **it replicates within today's
-protocol — no wire-contract change**. Also gives an audit trail, consistent with
-RolloMap's evidence-first ethos.
-
-**Cost:** migration (`notes.archived_at`), an archive route that records the
-event, an `applyEvent` handler, and a UI change (edit → archive + new). Client +
-own server only.
+> **Remaining:** a webapp affordance to *view* archived notes / un-hide them is
+> not built (the API supports `?include_archived=1`).
 
 ### 2. Contact groups should replicate across a user's own devices
 

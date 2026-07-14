@@ -135,7 +135,7 @@ server.tool(
           WHERE person_id = $1 AND status = 'open' ORDER BY due_date NULLS LAST`,
         [person.id],
       ),
-      query(`SELECT body, created_at FROM note WHERE person_id = $1 ORDER BY created_at DESC LIMIT 5`, [person.id]),
+      query(`SELECT body, created_at FROM note WHERE person_id = $1 AND archived_at IS NULL ORDER BY created_at DESC LIMIT 5`, [person.id]),
     ]);
 
     return ok({
@@ -607,13 +607,13 @@ server.tool(
           WHERE ip.person_id = $1 ORDER BY i.occurred_at DESC LIMIT 8`,
         [pid],
       ),
-      query(`SELECT body, created_at FROM note WHERE person_id = $1 ORDER BY created_at DESC LIMIT 8`, [pid]),
+      query(`SELECT body, created_at FROM note WHERE person_id = $1 AND archived_at IS NULL ORDER BY created_at DESC LIMIT 8`, [pid]),
     ]);
 
     // Pull prior Deep Dives separately so the agent can see how this person has changed over time.
     const deepDivesRes = await query(
       `SELECT id, body, created_at FROM note
-        WHERE person_id = $1 AND kind = 'deep_dive'
+        WHERE person_id = $1 AND kind = 'deep_dive' AND archived_at IS NULL
         ORDER BY created_at DESC LIMIT 5`,
       [pid],
     );

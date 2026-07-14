@@ -107,11 +107,11 @@ peopleRouter.get('/:id', async (req, res) => {
       [id],
     ),
     query(
-      `SELECT * FROM note WHERE person_id = $1 AND kind = 'note' ORDER BY created_at DESC`,
+      `SELECT * FROM note WHERE person_id = $1 AND kind = 'note' AND archived_at IS NULL ORDER BY created_at DESC`,
       [id],
     ),
     query(
-      `SELECT * FROM note WHERE person_id = $1 AND kind = 'deep_dive' ORDER BY created_at DESC`,
+      `SELECT * FROM note WHERE person_id = $1 AND kind = 'deep_dive' AND archived_at IS NULL ORDER BY created_at DESC`,
       [id],
     ),
     query(
