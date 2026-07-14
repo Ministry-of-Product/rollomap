@@ -28,7 +28,7 @@ def deaccent(s):
 
 def fetch_db(api):
     base = api.rstrip("/")
-    with urllib.request.urlopen(f"{base}?limit=500", timeout=10) as r:
+    with urllib.request.urlopen(f"{base}?limit=100000", timeout=30) as r:
         return json.loads(r.read())["people"]
 
 
