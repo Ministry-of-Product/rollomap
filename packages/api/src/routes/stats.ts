@@ -11,7 +11,7 @@ statsRouter.get('/', async (_req, res) => {
        (SELECT count(*) FROM topic WHERE workspace_id = $1) AS topics,
        (SELECT count(*) FROM source_item WHERE workspace_id = $1) AS source_items,
        (SELECT count(*) FROM commitment WHERE workspace_id = $1 AND status = 'open') AS open_commitments,
-       (SELECT count(*) FROM note WHERE workspace_id = $1) AS notes`,
+       (SELECT count(*) FROM note WHERE workspace_id = $1 AND archived_at IS NULL) AS notes`,
     [WORKSPACE_ID],
   );
   res.json(result.rows[0]);

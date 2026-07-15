@@ -157,7 +157,7 @@ queryRouter.post('/person-briefing', async (req, res) => {
          WHERE person_id = $1 AND status = 'open' ORDER BY due_date NULLS LAST`,
       [person.id],
     ),
-    query(`SELECT body, created_at FROM note WHERE person_id = $1 ORDER BY created_at DESC LIMIT 5`, [person.id]),
+    query(`SELECT body, created_at FROM note WHERE person_id = $1 AND archived_at IS NULL ORDER BY created_at DESC LIMIT 5`, [person.id]),
   ]);
 
   const lastInteraction = interactions.rows[0];
@@ -208,7 +208,7 @@ queryRouter.post('/search', async (req, res) => {
     ),
     query(
       `SELECT id, body, person_id FROM note
-         WHERE workspace_id = $1 AND to_tsvector('english', body) @@ to_tsquery('english', $2)
+         WHERE workspace_id = $1 AND archived_at IS NULL AND to_tsvector('english', body) @@ to_tsquery('english', $2)
          LIMIT $3`,
       [WORKSPACE_ID, tsQuery, limit],
     ),

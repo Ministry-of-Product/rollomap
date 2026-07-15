@@ -38,6 +38,7 @@ export const SYNC_OPERATIONS = [
   'topic.created',
   'topic.linked',
   'note.created',
+  'note.archived',
   'interaction.created',
   'field.asserted',
   // Workspace personalization profile (MIN-1123)

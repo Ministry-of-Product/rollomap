@@ -105,6 +105,7 @@ export async function backfillSyncEvents(): Promise<BackfillResult> {
     'topic.linked': { emitted: 0, skipped: 0 },
     'interaction.created': { emitted: 0, skipped: 0 },
     'note.created': { emitted: 0, skipped: 0 },
+    'note.archived': { emitted: 0, skipped: 0 },
     'field.asserted': { emitted: 0, skipped: 0 },
     'profile.updated': { emitted: 0, skipped: 0 },
   };
@@ -317,6 +318,17 @@ export async function backfillSyncEvents(): Promise<BackfillResult> {
             byOp['note.created']!.emitted++;
           } else {
             byOp['note.created']!.skipped++;
+          }
+          // Preserve an already-archived note's state so a fresh backfill doesn't
+          // resurrect it on peers (create replicates, then archive re-archives).
+          if (note.archived_at && (await hasNoEvent(client, noteId, 'note.archived'))) {
+            await recordEvent(client, {
+              entityType: 'note',
+              entityId: noteId,
+              operation: 'note.archived',
+              payload: { id: noteId, workspace_id: note.workspace_id, archived_at: note.archived_at },
+            });
+            byOp['note.archived']!.emitted++;
           }
         }
       });

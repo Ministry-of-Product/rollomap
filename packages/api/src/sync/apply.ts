@@ -124,6 +124,9 @@ export async function applyEvent(
     case 'note.created':
       return applyNote(client, payload);
 
+    case 'note.archived':
+      return applyNoteArchive(client, payload);
+
     case 'interaction.created':
       return applyInteraction(client, payload);
 
@@ -344,6 +347,25 @@ async function applyNote(client: QueryableClient, p: Row): Promise<ApplyResult> 
       p.created_at ?? null,
       p.updated_at ?? null,
     ],
+  );
+  return { applied: true };
+}
+
+/**
+ * Soft-archive a note by id; idempotent. Never un-archives (archived_at is
+ * set-once) and never hard-deletes. If the note isn't present locally yet
+ * (e.g. archive arrives before create), it's a no-op — a later note.created
+ * won't resurrect it because create uses ON CONFLICT DO NOTHING, and a
+ * re-applied archive will then stick.
+ */
+async function applyNoteArchive(client: QueryableClient, p: Row): Promise<ApplyResult> {
+  if (!p.id) return { applied: false, reason: 'note.archived missing id' };
+  await client.query(
+    `UPDATE note
+        SET archived_at = COALESCE(archived_at, COALESCE($3::timestamptz, now())),
+            updated_at = now()
+      WHERE workspace_id = $1 AND id = $2`,
+    [(p.workspace_id as string) ?? WORKSPACE_ID, p.id, p.archived_at ?? null],
   );
   return { applied: true };
 }

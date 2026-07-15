@@ -746,4 +746,91 @@ describe('e2e sync harness — isolated multi-device scenarios', () => {
       await teardownAll(devices);
     }
   });
+
+  // ── Scenario 8 ──────────────────────────────────────────────────────────────
+  // Notes are immutable + soft-archived (see docs/sync-field-coverage.md): a
+  // note.archived event maps to the wire `note.deleted` tombstone and replays on
+  // a peer as a soft-archive (archived_at set), never a hard delete. Verifies the
+  // note replicates on create, and the later archive replicates too.
+  it('Scenario 8: archiving a note on A replicates the archive to B (soft, not hard delete)', async () => {
+    const devices: Device[] = [];
+    try {
+      const a = await makeDevice('s8a');
+      const b = await makeDevice('s8b');
+      devices.push(a, b);
+
+      const personId = await createPersonOn(a, 'Note Owner');
+
+      // Create a note on A and record note.created.
+      const noteId = await withDeviceTxn(a, async (client) => {
+        const row = (
+          await client.query<{ id: string; workspace_id: string }>(
+            `INSERT INTO note (workspace_id, person_id, body, kind)
+             VALUES ($1, $2, 'first thoughts', 'note') RETURNING *`,
+            [WORKSPACE_ID, personId],
+          )
+        ).rows[0]!;
+        await recordEvent(client, {
+          entityType: 'note',
+          entityId: row.id,
+          operation: 'note.created',
+          payload: row,
+        });
+        return row.id;
+      });
+
+      // Replicate the person + note to B.
+      await syncDevices(a, b);
+      const noteOnB = await b.pool.query<{ archived_at: Date | null }>(
+        `SELECT archived_at FROM note WHERE id = $1 AND workspace_id = $2`,
+        [noteId, WORKSPACE_ID],
+      );
+      assert.equal(noteOnB.rowCount, 1, 'note must replicate to B on create');
+      assert.equal(noteOnB.rows[0]!.archived_at, null, 'note is live (not archived) on B');
+
+      // Archive the note on A (soft-archive + note.archived event).
+      await withDeviceTxn(a, async (client) => {
+        const row = (
+          await client.query<{ id: string; workspace_id: string; archived_at: Date }>(
+            `UPDATE note SET archived_at = now(), updated_at = now()
+              WHERE workspace_id = $1 AND id = $2 AND archived_at IS NULL RETURNING *`,
+            [WORKSPACE_ID, noteId],
+          )
+        ).rows[0]!;
+        await recordEvent(client, {
+          entityType: 'note',
+          entityId: row.id,
+          operation: 'note.archived',
+          payload: { id: row.id, workspace_id: row.workspace_id, archived_at: row.archived_at },
+        });
+      });
+
+      // Replicate the archive to B.
+      const atob = await syncDevices(a, b);
+      assert.ok(atob.transferred > 0, `archive event must transfer (got ${atob.transferred})`);
+
+      // The note row still EXISTS on B (soft-archive, not hard delete) but is archived.
+      const archivedOnB = await b.pool.query<{ archived_at: Date | null }>(
+        `SELECT archived_at FROM note WHERE id = $1 AND workspace_id = $2`,
+        [noteId, WORKSPACE_ID],
+      );
+      assert.equal(archivedOnB.rowCount, 1, 'note row must still exist on B (soft-archive)');
+      assert.ok(archivedOnB.rows[0]!.archived_at, 'note must be archived on B after sync');
+
+      // Idempotent: re-syncing does not error or un-archive.
+      const noOp = await syncDevices(a, b);
+      assert.equal(noOp.transferred, 0, 're-sync transfers nothing new');
+      const stillArchived = await b.pool.query<{ archived_at: Date | null }>(
+        `SELECT archived_at FROM note WHERE id = $1 AND workspace_id = $2`,
+        [noteId, WORKSPACE_ID],
+      );
+      assert.ok(stillArchived.rows[0]!.archived_at, 'note stays archived on B after re-sync');
+    } catch (err) {
+      if (devices[0]) await dumpEvents(devices[0], 's8a').catch(() => {});
+      if (devices[1]) await dumpEvents(devices[1], 's8b').catch(() => {});
+      throw err;
+    } finally {
+      await teardownAll(devices);
+    }
+  });
 });

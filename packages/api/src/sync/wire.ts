@@ -26,6 +26,7 @@
  *   identity.added        identity.added        person_identity → identity
  *   topic.linked          topic.linked          person_topic → topic
  *   note.created          note.created          note → note
+ *   note.archived         note.deleted          note → note
  *   interaction.created   interaction.created   interaction → interaction
  *   field.asserted        assertion.added       person → assertion
  *   profile.updated       profile.updated       workspace_profile → profile
@@ -45,8 +46,8 @@
  *   group.imported        ─┘  shared out-of-band, not cloud-replicated.
  *
  * ── Wire ops without a current local equivalent ──────────────────────────────
- *   identity.removed, topic.created, topic.unlinked, note.updated, note.deleted,
- *   interaction.updated, interaction.deleted, commitment.created/updated/deleted
+ *   identity.removed, topic.unlinked, note.updated, interaction.updated,
+ *   interaction.deleted, commitment.created/updated/deleted
  *   exist in the wire enum but have no local op yet. fromWireEvent passes them
  *   through as-is; applyEvent will skip unknown ops without breaking the batch.
  */
@@ -270,6 +271,18 @@ const OP_TABLE: Readonly<Record<string, OpEntry>> = {
   'note.created': {
     pushable: true,
     wireOp: 'note.created',
+    wireEntityType: 'note',
+    localEntityType: 'note',
+  },
+  /**
+   * note.archived → note.deleted
+   * Notes are immutable + soft-archived (see docs/sync-field-coverage.md). A local
+   * archive maps to the wire `note.deleted` tombstone so it replicates within the
+   * existing protocol; applyEvent replays it as a soft-archive, never a hard delete.
+   */
+  'note.archived': {
+    pushable: true,
+    wireOp: 'note.deleted',
     wireEntityType: 'note',
     localEntityType: 'note',
   },

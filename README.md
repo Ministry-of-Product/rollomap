@@ -86,6 +86,9 @@ A local client can run as a local-first replica that pairs to a cloud server
 the API: `POST /api/cloud/sync` pushes local changes and pulls peers'. Trigger
 one by hand with:
 
+> For exactly which entities and fields replicate (and which are local-only),
+> see [`docs/sync-field-coverage.md`](docs/sync-field-coverage.md).
+
 ```bash
 curl -X POST http://localhost:4000/api/cloud/sync
 ```
