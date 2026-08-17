@@ -9,9 +9,12 @@ queryRouter.post('/people-for-idea', async (req, res) => {
   const Body = z.object({
     idea: z.string().min(1),
     limit: z.number().int().min(1).max(50).optional(),
-    relationship_strength_min: z.number().min(0).max(1).optional(),
+    // relationship_strength_min removed (MIN-1511): the column is uncomputed
+    // (always 0 for every person), so any nonzero threshold silently excluded
+    // the entire network. Do not reintroduce a filter on relationship_strength
+    // until it's actually computed.
   });
-  const { idea, limit = 10, relationship_strength_min = 0 } = Body.parse(req.body);
+  const { idea, limit = 10 } = Body.parse(req.body);
 
   const tsQuery = idea
     .split(/\s+/)
@@ -67,9 +70,10 @@ queryRouter.post('/people-for-idea', async (req, res) => {
             coalesce(pts.matched_topics, '[]'::json) AS matched_topics,
             coalesce(pis.top_interactions, '[]'::json) AS evidence_interactions,
             (
+              -- relationship_strength dropped from this score: it is uncomputed
+              -- (always 0, see MIN-1511) and was silently contributing nothing.
               30 * least(coalesce(pts.topic_score, 0), 1.0) +
               20 * least(coalesce(pis.interaction_score, 0), 1.0) +
-              15 * coalesce(p.relationship_strength, 0) +
               10 * least(coalesce(ss.summary_rank, 0), 1.0) +
               5  * (CASE WHEN p.last_seen_at > now() - interval '180 days' THEN 1 ELSE 0 END)
             ) AS score
@@ -78,11 +82,10 @@ queryRouter.post('/people-for-idea', async (req, res) => {
        LEFT JOIN person_interaction_score pis ON pis.person_id = p.id
        LEFT JOIN summary_score ss ON ss.person_id = p.id
       WHERE p.workspace_id = $1
-        AND p.relationship_strength >= $3
         AND (pts.topic_score IS NOT NULL OR pis.interaction_score IS NOT NULL OR ss.summary_rank IS NOT NULL)
       ORDER BY score DESC
-      LIMIT $4`,
-    [WORKSPACE_ID, tsQuery, relationship_strength_min, limit],
+      LIMIT $3`,
+    [WORKSPACE_ID, tsQuery, limit],
   );
 
   res.json({
@@ -133,7 +136,9 @@ queryRouter.post('/person-briefing', async (req, res) => {
     : await query(
         `SELECT * FROM person WHERE workspace_id = $1
            AND (lower(display_name) = lower($2) OR lower(primary_email) = lower($2))
-         ORDER BY relationship_strength DESC LIMIT 1`,
+         -- relationship_strength is uncomputed (always 0, see MIN-1511) — prefer the
+         -- most-interacted, most-recently-seen match among multiple hits instead.
+         ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
         [WORKSPACE_ID, body.name],
       );
   if (personRow.rowCount === 0) return res.status(404).json({ error: 'not_found' });
@@ -226,14 +231,18 @@ queryRouter.post('/search', async (req, res) => {
 // Neglected relationships
 queryRouter.get('/neglected', async (req, res) => {
   const days = Number((req.query.days as string) || 90);
+  // The relationship_strength >= 0.3 filter that used to live here is removed
+  // (MIN-1511): the column is uncomputed (always 0 for every person), so that
+  // hardcoded threshold silently excluded the entire network on every call —
+  // a well-formed empty result with no error. Do not reintroduce a filter on
+  // relationship_strength until it's actually computed.
   const result = await query(
     `SELECT id, display_name, company, title, last_seen_at, relationship_strength, interaction_count
        FROM person
       WHERE workspace_id = $1
         AND interaction_count > 0
         AND (last_seen_at IS NULL OR last_seen_at < now() - ($2 || ' days')::interval)
-        AND relationship_strength >= 0.3
-      ORDER BY relationship_strength DESC, last_seen_at ASC NULLS FIRST
+      ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC
       LIMIT 50`,
     [WORKSPACE_ID, days],
   );

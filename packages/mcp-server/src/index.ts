@@ -70,7 +70,7 @@ server.tool(
 // ------- search_people -------
 server.tool(
   'search_people',
-  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text.',
+  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text. Note: results include a relationship_strength field that is not yet computed (always 0) — do not use it to judge relationship quality.',
   {
     query: z.string().describe('Free-text query: name, email, company, or topic.'),
     limit: z.number().int().min(1).max(50).default(10),
@@ -83,7 +83,9 @@ server.tool(
           AND (tsv @@ plainto_tsquery('english', $2)
                OR display_name ILIKE '%' || $2 || '%'
                OR primary_email ILIKE '%' || $2 || '%')
-        ORDER BY relationship_strength DESC, display_name ASC
+        -- relationship_strength is uncomputed (always 0, see MIN-1511) — order by
+        -- interaction frequency/recency instead so results aren't just alphabetical.
+        ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST, display_name ASC
         LIMIT $3`,
       [WORKSPACE_ID, q, limit],
     );
@@ -94,7 +96,7 @@ server.tool(
 // ------- brief_person -------
 server.tool(
   'brief_person',
-  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes.',
+  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes. Note: the relationship_strength field in the response is not yet computed (always 0) — do not use it to judge relationship quality.',
   {
     person_id: z.string().uuid().optional(),
     name: z.string().optional(),
@@ -109,7 +111,9 @@ server.tool(
           `SELECT * FROM person WHERE workspace_id = $1
              AND (lower(display_name) = lower($2) OR lower(primary_email) = lower($2)
                   OR display_name ILIKE '%' || $2 || '%')
-           ORDER BY relationship_strength DESC LIMIT 1`,
+           -- relationship_strength is uncomputed (always 0, see MIN-1511) — prefer the
+           -- most-interacted, most-recently-seen match among multiple hits instead.
+           ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
           [WORKSPACE_ID, name],
         );
     if (personRow.rowCount === 0) {
@@ -167,13 +171,12 @@ server.tool(
 // ------- find_people_for_idea -------
 server.tool(
   'find_people_for_idea',
-  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates.',
+  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates. Note: the relationship_strength field in each result is not yet computed (always 0) and plays no part in the ranking — do not use it to judge relationship quality.',
   {
     idea: z.string().describe('Description of the idea, product, opportunity, or question.'),
     limit: z.number().int().min(1).max(50).default(10),
-    relationship_strength_min: z.number().min(0).max(1).default(0),
   },
-  async ({ idea, limit, relationship_strength_min }) => {
+  async ({ idea, limit }) => {
     const tsq = tsQuery(idea);
     const result = await query(
       `WITH idea_topics AS (
@@ -212,9 +215,10 @@ server.tool(
               coalesce(pts.matched_topics, '[]'::json) AS matched_topics,
               coalesce(pis.top_interactions, '[]'::json) AS evidence_interactions,
               (
+                -- relationship_strength dropped from this score: it is uncomputed
+                -- (always 0, see MIN-1511) and was silently contributing nothing.
                 30 * least(coalesce(pts.topic_score, 0), 1.0) +
                 20 * least(coalesce(pis.interaction_score, 0), 1.0) +
-                15 * coalesce(p.relationship_strength, 0) +
                 10 * least(coalesce(ss.summary_rank, 0), 1.0) +
                 5  * (CASE WHEN p.last_seen_at > now() - interval '180 days' THEN 1 ELSE 0 END)
               ) AS score
@@ -223,11 +227,10 @@ server.tool(
          LEFT JOIN person_interaction_score pis ON pis.person_id = p.id
          LEFT JOIN summary_score ss ON ss.person_id = p.id
         WHERE p.workspace_id = $1
-          AND p.relationship_strength >= $3
           AND (pts.topic_score IS NOT NULL OR pis.interaction_score IS NOT NULL OR ss.summary_rank IS NOT NULL)
         ORDER BY score DESC
-        LIMIT $4`,
-      [WORKSPACE_ID, tsq, relationship_strength_min, limit],
+        LIMIT $3`,
+      [WORKSPACE_ID, tsq, limit],
     );
 
     return ok({
@@ -322,22 +325,24 @@ server.tool(
 // ------- find_neglected_relationships -------
 server.tool(
   'find_neglected_relationships',
-  'List meaningful relationships the user has not interacted with in N days.',
+  'List meaningful relationships the user has not interacted with in N days. Note: the relationship_strength field in each result is not yet computed (always 0) — do not use it to judge relationship quality.',
   {
     days: z.number().int().min(1).max(3650).default(90),
-    relationship_strength_min: z.number().min(0).max(1).default(0.3),
+    // relationship_strength_min removed (MIN-1511): the column is uncomputed
+    // (always 0 for every person), so any nonzero threshold silently excluded
+    // the entire network — a well-formed empty result with no error. Do not
+    // reintroduce a filter on relationship_strength until it's actually computed.
   },
-  async ({ days, relationship_strength_min }) => {
+  async ({ days }) => {
     const result = await query(
       `SELECT id, display_name, company, title, last_seen_at, relationship_strength, interaction_count
          FROM person
         WHERE workspace_id = $1
           AND interaction_count > 0
           AND (last_seen_at IS NULL OR last_seen_at < now() - ($2 || ' days')::interval)
-          AND relationship_strength >= $3
-        ORDER BY relationship_strength DESC, last_seen_at ASC NULLS FIRST
+        ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC
         LIMIT 50`,
-      [WORKSPACE_ID, days, relationship_strength_min],
+      [WORKSPACE_ID, days],
     );
     return ok({ days, people: result.rows });
   },
@@ -615,7 +620,7 @@ server.tool(
 // or asks the user to paste profile text, then calls save_person_research.
 server.tool(
   'research_person',
-  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research.',
+  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research. Note: the relationship_strength field in the response is not yet computed (always 0) — do not use it to judge relationship quality.',
   {
     linkedin_url: z.string().url().optional().describe('LinkedIn profile URL — preferred way to identify someone.'),
     person_id: z.string().uuid().optional(),
@@ -644,7 +649,9 @@ server.tool(
         `SELECT * FROM person WHERE workspace_id = $1
            AND (lower(display_name) = lower($2)
                 OR display_name ILIKE '%' || $2 || '%')
-         ORDER BY relationship_strength DESC LIMIT 1`,
+         -- relationship_strength is uncomputed (always 0, see MIN-1511) — prefer the
+         -- most-interacted, most-recently-seen match among multiple hits instead.
+         ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
         [WORKSPACE_ID, name],
       );
       person = r.rows[0] ?? null;

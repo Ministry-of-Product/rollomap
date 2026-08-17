@@ -56,7 +56,9 @@ peopleRouter.get('/', async (req, res) => {
                WHERE pt.person_id = p.id) AS topics
      FROM person p
      WHERE ${where}
-     ORDER BY p.user_pinned DESC, p.relationship_strength DESC, p.display_name ASC
+     -- relationship_strength is uncomputed (always 0, see MIN-1511) — order by
+     -- interaction frequency/recency instead so results aren't just alphabetical.
+     ORDER BY p.user_pinned DESC, p.interaction_count DESC, p.last_seen_at DESC NULLS LAST, p.display_name ASC
      LIMIT $${params.length}`,
     params,
   );
