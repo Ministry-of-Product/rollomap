@@ -522,6 +522,93 @@ server.tool(
   },
 );
 
+// ------- list_companies -------
+// Documented, curated denylist for exclude_non_employers (default true) — matched
+// exact against lower(trim(company)). Kept intentionally narrow and literal:
+// non-company placeholder values plus staffing/recruiting agencies identified by
+// inspecting the live data (MIN-1507 prep). Brand/parent aliasing (e.g. "Meta" vs
+// "Facebook") is NOT guessed at here — that needs a human and is left to the
+// consumer of this tool.
+const NON_EMPLOYER_DENYLIST = [
+  // placeholder / non-employer values (not real companies)
+  'self-employed', 'self employed',
+  'freelance', 'freelancer',
+  'independent', 'independent consultant', 'independent contractor',
+  'stealth', 'stealth startup', 'stealth mode startup', 'stealth ai startup',
+  // staffing / recruiting agencies identified in the data
+  'teksystems', 'randstad enterprise', 'wollborg michelson recruiting',
+  "here's waldo recruiting", 'here’s waldo recruiting', // both apostrophe variants appear in source data
+];
+
+server.tool(
+  'list_companies',
+  'List distinct employers represented in the user\'s network (grouped case-insensitively on company name), with the people at each. Enumeration tool for reasoning over the network as a whole — pair with search_people once you know a specific target.',
+  {
+    min_contacts: z.number().int().min(1).default(1).describe('Only return companies with at least this many contacts.'),
+    query: z.string().optional().describe('Optional case-insensitive substring filter on company name.'),
+    limit: z.number().int().min(1).max(250).default(50),
+    exclude_non_employers: z.boolean().default(true).describe('Filter a documented denylist of placeholder values (Self-employed, Freelance, Independent, Stealth) and identified staffing agencies. Pass false to see the raw tail.'),
+  },
+  async ({ min_contacts, query: companyQuery, limit, exclude_non_employers }) => {
+    const params: unknown[] = [WORKSPACE_ID];
+    let where = `p.workspace_id = $1 AND p.company IS NOT NULL AND trim(p.company) <> ''`;
+    if (companyQuery) {
+      params.push(companyQuery.toLowerCase());
+      where += ` AND lower(trim(p.company)) LIKE '%' || $${params.length} || '%'`;
+    }
+    if (exclude_non_employers) {
+      params.push(NON_EMPLOYER_DENYLIST);
+      where += ` AND NOT (lower(trim(p.company)) = ANY($${params.length}::text[]))`;
+    }
+    params.push(min_contacts);
+    const minContactsIdx = params.length;
+    params.push(limit);
+    const limitIdx = params.length;
+
+    const result = await query(
+      `WITH matched AS (
+         SELECT p.id, p.display_name, p.last_seen_at,
+                lower(trim(p.company)) AS company_key,
+                trim(p.company) AS company_display,
+                -- position: person.title (MIN-1512 backfilled) wins; fall back to
+                -- the "Position: ..." line the LinkedIn import leaves in summary
+                -- (same pattern as packages/api/src/backfill-title-from-summary.ts);
+                -- null when neither is present.
+                NULLIF(trim(coalesce(p.title, substring(p.summary from 'Position:[ \t]*([^\n]*)'))), '') AS position
+           FROM person p
+          WHERE ${where}
+       ),
+       grouped AS (
+         SELECT company_key,
+                mode() WITHIN GROUP (ORDER BY company_display) AS company,
+                count(*) AS contact_count,
+                json_agg(
+                  json_build_object('id', id, 'display_name', display_name, 'position', position, 'last_seen_at', last_seen_at)
+                  ORDER BY last_seen_at DESC NULLS LAST, display_name ASC
+                ) AS people
+           FROM matched
+          GROUP BY company_key
+         HAVING count(*) >= $${minContactsIdx}
+       )
+       SELECT company, contact_count, people, count(*) OVER () AS total_companies
+         FROM grouped
+        ORDER BY contact_count DESC, company ASC
+        LIMIT $${limitIdx}`,
+      params,
+    );
+
+    const total_companies = result.rows.length ? Number(result.rows[0]!.total_companies) : 0;
+    return ok({
+      companies: result.rows.map(r => ({
+        company: r.company,
+        contact_count: Number(r.contact_count),
+        people: r.people,
+      })),
+      total_companies,
+    });
+  },
+);
+
 // ------- research_person -------
 // PREP step: resolves the target, returns context the agent needs to synthesize.
 // The agent (Claude) uses its own WebFetch on linkedin_url + any public sources,
