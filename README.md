@@ -129,12 +129,20 @@ this to your MCP client config (e.g. Claude Desktop's
       "args": ["-y", "tsx", "/absolute/path/to/rollomap/packages/mcp-server/src/index.ts"],
       "env": {
         "DATABASE_URL": "postgres://rollomap:rollomap@localhost:5432/rollomap",
-        "WORKSPACE_ID": "00000000-0000-0000-0000-000000000001"
+        "WORKSPACE_ID": "00000000-0000-0000-0000-000000000001",
+        "API_BASE_URL": "http://localhost:4000"
       }
     }
   }
 }
 ```
+
+Most tools talk to Postgres directly, but `merge_person` and `delete_person`
+(MIN-1136) delegate to the REST API's existing merge/delete endpoints instead
+of duplicating that logic — so those two tools additionally require the API
+(`npm run dev:api` or the Docker `api` service) to be reachable at
+`API_BASE_URL` (defaults to `http://localhost:4000`). If it isn't, those two
+tools fail with a clear error; every other tool is unaffected.
 
 You can also run it directly to verify it boots:
 
@@ -169,6 +177,8 @@ calling the script directly:
 | `find_neglected_relationships`  | Surface high-strength contacts you haven't seen in N days.   |
 | `add_note`                      | Attach a manual note to a person.                            |
 | `update_person`                 | Edit a person's editable fields (logged as a correction).    |
+| `merge_person`                  | Merge a duplicate person into another (via the REST API).    |
+| `delete_person`                 | Soft-delete a person (via the REST API).                     |
 | `add_interaction`               | Log a meeting, email summary, or call.                       |
 | `list_topics`                   | List topics with associated person counts.                   |
 | `get_profile`                   | Read the workspace profile (owner identity, interests, import recipes, journal skip-phrases). |

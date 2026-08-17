@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { pool, query, WORKSPACE_ID, tsQuery } from './db.js';
 import { recordEvent, withSyncTxn } from './sync-events.js';
 import { getProfile, updateProfile, getInterests, type WorkspaceProfilePatch } from './profile.js';
+import { mergePeopleViaApi, deletePersonViaApi } from './api-client.js';
 
 const server = new McpServer({
   name: 'rollomap',
@@ -77,16 +78,24 @@ server.tool(
   },
   async ({ query: q, limit }) => {
     const result = await query(
-      `SELECT id, display_name, primary_email, company, title, summary, last_seen_at, relationship_strength, known_phones
-         FROM person
-        WHERE workspace_id = $1
-          AND (tsv @@ plainto_tsquery('english', $2)
-               OR display_name ILIKE '%' || $2 || '%'
-               OR primary_email ILIKE '%' || $2 || '%')
+      `SELECT p.id, p.display_name, p.primary_email, p.company, p.title, p.summary, p.last_seen_at, p.relationship_strength, p.known_phones
+         FROM person p
+        WHERE p.workspace_id = $1
+          AND (p.tsv @@ plainto_tsquery('english', $2)
+               OR p.display_name ILIKE '%' || $2 || '%'
+               OR p.primary_email ILIKE '%' || $2 || '%')
+          -- MIN-1136: exclude tombstoned people (soft-deleted via delete_person,
+          -- or merged away via merge_person) — mirrors NOT_TOMBSTONED in
+          -- packages/api/src/routes/people.ts so a deleted/merged person
+          -- actually stops showing up here, not just in the REST API.
+          AND NOT EXISTS (
+            SELECT 1 FROM entity_tombstone et
+             WHERE et.workspace_id = p.workspace_id AND et.entity_type = 'person' AND et.entity_id = p.id
+          )
         -- relationship_strength is now computed (MIN-1169) and is the primary
         -- ranking key, with the MIN-1511 tiebreakers kept underneath — they
         -- keep never-contacted people (score 0) ordered sensibly.
-        ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST, display_name ASC
+        ORDER BY p.relationship_strength DESC, p.interaction_count DESC, p.last_seen_at DESC NULLS LAST, p.display_name ASC
         LIMIT $3`,
       [WORKSPACE_ID, q, limit],
     );
@@ -436,6 +445,71 @@ server.tool(
       return { isError: true, content: [{ type: 'text', text: 'person_not_found' }] };
     }
     return ok({ person });
+  },
+);
+
+// ------- merge_person -------
+// Delegates to the REST API's existing, reversible merge implementation
+// (packages/api/src/sync/merge.ts via POST /api/people/merge) rather than
+// reimplementing merge semantics here — see packages/mcp-server/src/api-client.ts
+// for why the MCP server can't import that module directly.
+server.tool(
+  'merge_person',
+  'Merge two person records that represent the same human. Moves every interaction, note, commitment, and topic from loser_id onto survivor_id, then soft-deletes (tombstones) loser_id as a redirect. Reversible via the merge history (see GET /api/people/merges), though no MCP tool exposes reversal yet. Returns the updated survivor.',
+  {
+    survivor_id: z.string().uuid().describe('Person to keep. All references from loser_id are moved onto this person.'),
+    loser_id: z.string().uuid().describe('Duplicate person to merge away. Ends up tombstoned (soft-deleted) as a redirect to survivor_id.'),
+  },
+  async ({ survivor_id, loser_id }) => {
+    if (survivor_id === loser_id) {
+      return { isError: true, content: [{ type: 'text', text: 'survivor_id and loser_id must be different people.' }] };
+    }
+
+    // Read-only existence guard: the merge endpoint itself moves references
+    // and tombstones loser_id unconditionally, without checking that either
+    // side currently exists (see moveReferences/tombstoneEntity in
+    // sync/merge.ts) — so a nonexistent or already-merged-away loser_id would
+    // otherwise succeed silently instead of raising a readable error here.
+    const existing = await query<{ id: string }>(
+      `SELECT p.id FROM person p
+        WHERE p.workspace_id = $1 AND p.id = ANY($2::uuid[])
+          AND NOT EXISTS (
+            SELECT 1 FROM entity_tombstone et
+             WHERE et.workspace_id = p.workspace_id AND et.entity_type = 'person' AND et.entity_id = p.id
+          )`,
+      [WORKSPACE_ID, [survivor_id, loser_id]],
+    );
+    const found = new Set(existing.rows.map(r => r.id));
+    if (!found.has(survivor_id)) {
+      return { isError: true, content: [{ type: 'text', text: `survivor_id not found: ${survivor_id} (missing, or already tombstoned/merged away).` }] };
+    }
+    if (!found.has(loser_id)) {
+      return { isError: true, content: [{ type: 'text', text: `loser_id not found: ${loser_id} (missing, or already tombstoned/merged away).` }] };
+    }
+
+    await mergePeopleViaApi(survivor_id, loser_id);
+
+    const survivorRes = await query(`SELECT * FROM person WHERE workspace_id = $1 AND id = $2`, [WORKSPACE_ID, survivor_id]);
+    return ok({ survivor: survivorRes.rows[0] });
+  },
+);
+
+// ------- delete_person -------
+// Delegates to the REST API's existing soft-delete (packages/api/src/sync/tombstone.ts
+// via DELETE /api/people/:id) — see api-client.ts for why the MCP server can't
+// tombstone directly.
+server.tool(
+  'delete_person',
+  'Delete a person from the user\'s relationship memory. This is a soft delete (tombstone): the record stops appearing in search_people and other reads, but is not physically removed. Use merge_person instead if this is a duplicate you want to consolidate rather than remove outright.',
+  {
+    person_id: z.string().uuid(),
+  },
+  async ({ person_id }) => {
+    const { deleted } = await deletePersonViaApi(person_id);
+    if (!deleted) {
+      return { isError: true, content: [{ type: 'text', text: `person_not_found: ${person_id} (missing, or already deleted).` }] };
+    }
+    return ok({ deleted: true, person_id });
   },
 );
 

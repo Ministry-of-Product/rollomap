@@ -13,6 +13,10 @@ fi
 
 export DATABASE_URL="${DATABASE_URL:-postgres://rollomap:rollomap@localhost:5432/rollomap}"
 export WORKSPACE_ID="${WORKSPACE_ID:-00000000-0000-0000-0000-000000000001}"
+# merge_person/delete_person (MIN-1136) call the REST API instead of Postgres
+# directly — see packages/mcp-server/src/api-client.ts. Point this at wherever
+# the API is actually running if it's not on the default port.
+export API_BASE_URL="${API_BASE_URL:-http://localhost:4000}"
 
 cd "$REPO_ROOT"
 
