@@ -70,7 +70,7 @@ server.tool(
 // ------- search_people -------
 server.tool(
   'search_people',
-  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text. Note: results include a relationship_strength field that is not yet computed (always 0) — do not use it to judge relationship quality.',
+  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text. Results include relationship_strength: a computed 0-1 recency x frequency score over past interactions (0 for people with no interaction history — not a quality judgment, just no data yet).',
   {
     query: z.string().describe('Free-text query: name, email, company, or topic.'),
     limit: z.number().int().min(1).max(50).default(10),
@@ -83,9 +83,10 @@ server.tool(
           AND (tsv @@ plainto_tsquery('english', $2)
                OR display_name ILIKE '%' || $2 || '%'
                OR primary_email ILIKE '%' || $2 || '%')
-        -- relationship_strength is uncomputed (always 0, see MIN-1511) — order by
-        -- interaction frequency/recency instead so results aren't just alphabetical.
-        ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST, display_name ASC
+        -- relationship_strength is now computed (MIN-1169) and is the primary
+        -- ranking key, with the MIN-1511 tiebreakers kept underneath — they
+        -- keep never-contacted people (score 0) ordered sensibly.
+        ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST, display_name ASC
         LIMIT $3`,
       [WORKSPACE_ID, q, limit],
     );
@@ -96,7 +97,7 @@ server.tool(
 // ------- brief_person -------
 server.tool(
   'brief_person',
-  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes. Note: the relationship_strength field in the response is not yet computed (always 0) — do not use it to judge relationship quality.',
+  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes. The response\'s relationship_strength is a computed 0-1 recency x frequency score over past interactions (0 for no interaction history).',
   {
     person_id: z.string().uuid().optional(),
     name: z.string().optional(),
@@ -111,9 +112,10 @@ server.tool(
           `SELECT * FROM person WHERE workspace_id = $1
              AND (lower(display_name) = lower($2) OR lower(primary_email) = lower($2)
                   OR display_name ILIKE '%' || $2 || '%')
-           -- relationship_strength is uncomputed (always 0, see MIN-1511) — prefer the
-           -- most-interacted, most-recently-seen match among multiple hits instead.
-           ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
+           -- relationship_strength is now computed (MIN-1169) — prefer the
+           -- strongest match among multiple same-name hits, falling back to
+           -- most-interacted / most-recently-seen (MIN-1511) as tiebreakers.
+           ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
           [WORKSPACE_ID, name],
         );
     if (personRow.rowCount === 0) {
@@ -171,7 +173,7 @@ server.tool(
 // ------- find_people_for_idea -------
 server.tool(
   'find_people_for_idea',
-  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates. Note: the relationship_strength field in each result is not yet computed (always 0) and plays no part in the ranking — do not use it to judge relationship quality.',
+  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates. relationship_strength (a computed 0-1 recency x frequency score) is a minor factor in the ranking, well behind topic and interaction text-match evidence.',
   {
     idea: z.string().describe('Description of the idea, product, opportunity, or question.'),
     limit: z.number().int().min(1).max(50).default(10),
@@ -215,10 +217,15 @@ server.tool(
               coalesce(pts.matched_topics, '[]'::json) AS matched_topics,
               coalesce(pis.top_interactions, '[]'::json) AS evidence_interactions,
               (
-                -- relationship_strength dropped from this score: it is uncomputed
-                -- (always 0, see MIN-1511) and was silently contributing nothing.
+                -- relationship_strength restored (MIN-1169: now actually
+                -- computed). Weight of 15 matches its original pre-MIN-1511
+                -- weight: an established relationship makes an idea more
+                -- actionable, but topic/interaction text-match evidence
+                -- (30+20=50) still dominates so strength alone can't outrank
+                -- an actual subject-matter fit.
                 30 * least(coalesce(pts.topic_score, 0), 1.0) +
                 20 * least(coalesce(pis.interaction_score, 0), 1.0) +
+                15 * coalesce(p.relationship_strength, 0) +
                 10 * least(coalesce(ss.summary_rank, 0), 1.0) +
                 5  * (CASE WHEN p.last_seen_at > now() - interval '180 days' THEN 1 ELSE 0 END)
               ) AS score
@@ -325,13 +332,13 @@ server.tool(
 // ------- find_neglected_relationships -------
 server.tool(
   'find_neglected_relationships',
-  'List meaningful relationships the user has not interacted with in N days. Note: the relationship_strength field in each result is not yet computed (always 0) — do not use it to judge relationship quality.',
+  'List meaningful relationships the user has not interacted with in N days. relationship_strength (a computed 0-1 recency x frequency score) is included per result but is naturally low here since staleness itself decays it — it is not used as a ranking or filter threshold.',
   {
     days: z.number().int().min(1).max(3650).default(90),
-    // relationship_strength_min removed (MIN-1511): the column is uncomputed
-    // (always 0 for every person), so any nonzero threshold silently excluded
-    // the entire network — a well-formed empty result with no error. Do not
-    // reintroduce a filter on relationship_strength until it's actually computed.
+    // relationship_strength_min stays removed (MIN-1511 / MIN-1169): even now
+    // that the column is computed, a min-strength threshold on a list defined
+    // by staleness would still risk silently dropping people. Do not
+    // reintroduce a filter/threshold on relationship_strength.
   },
   async ({ days }) => {
     const result = await query(
@@ -340,7 +347,11 @@ server.tool(
         WHERE workspace_id = $1
           AND interaction_count > 0
           AND (last_seen_at IS NULL OR last_seen_at < now() - ($2 || ' days')::interval)
-        ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC
+        -- Primary order stays staleness-first (most overdue first, MIN-1511);
+        -- relationship_strength (MIN-1169) is a trailing tiebreaker only, so
+        -- among equally-stale/equally-frequent people the ones who were
+        -- relatively more engaged before going quiet surface first.
+        ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC, relationship_strength DESC
         LIMIT 50`,
       [WORKSPACE_ID, days],
     );
@@ -620,7 +631,7 @@ server.tool(
 // or asks the user to paste profile text, then calls save_person_research.
 server.tool(
   'research_person',
-  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research. Note: the relationship_strength field in the response is not yet computed (always 0) — do not use it to judge relationship quality.',
+  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research. The response\'s relationship_strength is a computed 0-1 recency x frequency score over past interactions (0 for no interaction history).',
   {
     linkedin_url: z.string().url().optional().describe('LinkedIn profile URL — preferred way to identify someone.'),
     person_id: z.string().uuid().optional(),
@@ -649,9 +660,10 @@ server.tool(
         `SELECT * FROM person WHERE workspace_id = $1
            AND (lower(display_name) = lower($2)
                 OR display_name ILIKE '%' || $2 || '%')
-         -- relationship_strength is uncomputed (always 0, see MIN-1511) — prefer the
-         -- most-interacted, most-recently-seen match among multiple hits instead.
-         ORDER BY interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
+         -- relationship_strength is now computed (MIN-1169) — prefer the
+         -- strongest match among multiple same-name hits, falling back to
+         -- most-interacted / most-recently-seen (MIN-1511) as tiebreakers.
+         ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
         [WORKSPACE_ID, name],
       );
       person = r.rows[0] ?? null;

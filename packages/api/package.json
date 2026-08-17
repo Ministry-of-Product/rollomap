@@ -8,6 +8,7 @@
     "start": "node --import tsx src/index.ts",
     "seed": "tsx src/seed.ts",
     "backfill:title-from-summary": "tsx src/backfill-title-from-summary.ts",
+    "score:relationship-strength": "tsx src/score-relationship-strength.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "test:reset": "../../scripts/reset-test-db.sh",
