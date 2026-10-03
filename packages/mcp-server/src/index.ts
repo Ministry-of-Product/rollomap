@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { pool, query, WORKSPACE_ID, tsQuery } from './db.js';
 import { recordEvent, withSyncTxn } from './sync-events.js';
 import { getProfile, updateProfile, getInterests, type WorkspaceProfilePatch } from './profile.js';
+import { mergePeopleViaApi, deletePersonViaApi } from './api-client.js';
 
 const server = new McpServer({
   name: 'rollomap',
@@ -70,20 +71,31 @@ server.tool(
 // ------- search_people -------
 server.tool(
   'search_people',
-  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text.',
+  'Search for people in the user\'s relationship memory by name, email, company, role, or summary text. Results include relationship_strength: a computed 0-1 recency x frequency score over past interactions (0 for people with no interaction history — not a quality judgment, just no data yet).',
   {
     query: z.string().describe('Free-text query: name, email, company, or topic.'),
     limit: z.number().int().min(1).max(50).default(10),
   },
   async ({ query: q, limit }) => {
     const result = await query(
-      `SELECT id, display_name, primary_email, company, title, summary, last_seen_at, relationship_strength, known_phones
-         FROM person
-        WHERE workspace_id = $1
-          AND (tsv @@ plainto_tsquery('english', $2)
-               OR display_name ILIKE '%' || $2 || '%'
-               OR primary_email ILIKE '%' || $2 || '%')
-        ORDER BY relationship_strength DESC, display_name ASC
+      `SELECT p.id, p.display_name, p.primary_email, p.company, p.title, p.summary, p.last_seen_at, p.relationship_strength, p.known_phones
+         FROM person p
+        WHERE p.workspace_id = $1
+          AND (p.tsv @@ plainto_tsquery('english', $2)
+               OR p.display_name ILIKE '%' || $2 || '%'
+               OR p.primary_email ILIKE '%' || $2 || '%')
+          -- MIN-1136: exclude tombstoned people (soft-deleted via delete_person,
+          -- or merged away via merge_person) — mirrors NOT_TOMBSTONED in
+          -- packages/api/src/routes/people.ts so a deleted/merged person
+          -- actually stops showing up here, not just in the REST API.
+          AND NOT EXISTS (
+            SELECT 1 FROM entity_tombstone et
+             WHERE et.workspace_id = p.workspace_id AND et.entity_type = 'person' AND et.entity_id = p.id
+          )
+        -- relationship_strength is now computed (MIN-1169) and is the primary
+        -- ranking key, with the MIN-1511 tiebreakers kept underneath — they
+        -- keep never-contacted people (score 0) ordered sensibly.
+        ORDER BY p.relationship_strength DESC, p.interaction_count DESC, p.last_seen_at DESC NULLS LAST, p.display_name ASC
         LIMIT $3`,
       [WORKSPACE_ID, q, limit],
     );
@@ -94,7 +106,7 @@ server.tool(
 // ------- brief_person -------
 server.tool(
   'brief_person',
-  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes.',
+  'Generate an evidence-backed briefing for a person (by id or name): how the user knows them, last interaction, key topics, open loops, and notes. The response\'s relationship_strength is a computed 0-1 recency x frequency score over past interactions (0 for no interaction history).',
   {
     person_id: z.string().uuid().optional(),
     name: z.string().optional(),
@@ -109,7 +121,10 @@ server.tool(
           `SELECT * FROM person WHERE workspace_id = $1
              AND (lower(display_name) = lower($2) OR lower(primary_email) = lower($2)
                   OR display_name ILIKE '%' || $2 || '%')
-           ORDER BY relationship_strength DESC LIMIT 1`,
+           -- relationship_strength is now computed (MIN-1169) — prefer the
+           -- strongest match among multiple same-name hits, falling back to
+           -- most-interacted / most-recently-seen (MIN-1511) as tiebreakers.
+           ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
           [WORKSPACE_ID, name],
         );
     if (personRow.rowCount === 0) {
@@ -167,13 +182,12 @@ server.tool(
 // ------- find_people_for_idea -------
 server.tool(
   'find_people_for_idea',
-  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates.',
+  'Find people in the user\'s network who may care about an idea, product, or opportunity. Returns ranked, evidence-backed candidates. relationship_strength (a computed 0-1 recency x frequency score) is a minor factor in the ranking, well behind topic and interaction text-match evidence.',
   {
     idea: z.string().describe('Description of the idea, product, opportunity, or question.'),
     limit: z.number().int().min(1).max(50).default(10),
-    relationship_strength_min: z.number().min(0).max(1).default(0),
   },
-  async ({ idea, limit, relationship_strength_min }) => {
+  async ({ idea, limit }) => {
     const tsq = tsQuery(idea);
     const result = await query(
       `WITH idea_topics AS (
@@ -212,6 +226,12 @@ server.tool(
               coalesce(pts.matched_topics, '[]'::json) AS matched_topics,
               coalesce(pis.top_interactions, '[]'::json) AS evidence_interactions,
               (
+                -- relationship_strength restored (MIN-1169: now actually
+                -- computed). Weight of 15 matches its original pre-MIN-1511
+                -- weight: an established relationship makes an idea more
+                -- actionable, but topic/interaction text-match evidence
+                -- (30+20=50) still dominates so strength alone can't outrank
+                -- an actual subject-matter fit.
                 30 * least(coalesce(pts.topic_score, 0), 1.0) +
                 20 * least(coalesce(pis.interaction_score, 0), 1.0) +
                 15 * coalesce(p.relationship_strength, 0) +
@@ -223,11 +243,10 @@ server.tool(
          LEFT JOIN person_interaction_score pis ON pis.person_id = p.id
          LEFT JOIN summary_score ss ON ss.person_id = p.id
         WHERE p.workspace_id = $1
-          AND p.relationship_strength >= $3
           AND (pts.topic_score IS NOT NULL OR pis.interaction_score IS NOT NULL OR ss.summary_rank IS NOT NULL)
         ORDER BY score DESC
-        LIMIT $4`,
-      [WORKSPACE_ID, tsq, relationship_strength_min, limit],
+        LIMIT $3`,
+      [WORKSPACE_ID, tsq, limit],
     );
 
     return ok({
@@ -322,22 +341,28 @@ server.tool(
 // ------- find_neglected_relationships -------
 server.tool(
   'find_neglected_relationships',
-  'List meaningful relationships the user has not interacted with in N days.',
+  'List meaningful relationships the user has not interacted with in N days. relationship_strength (a computed 0-1 recency x frequency score) is included per result but is naturally low here since staleness itself decays it — it is not used as a ranking or filter threshold.',
   {
     days: z.number().int().min(1).max(3650).default(90),
-    relationship_strength_min: z.number().min(0).max(1).default(0.3),
+    // relationship_strength_min stays removed (MIN-1511 / MIN-1169): even now
+    // that the column is computed, a min-strength threshold on a list defined
+    // by staleness would still risk silently dropping people. Do not
+    // reintroduce a filter/threshold on relationship_strength.
   },
-  async ({ days, relationship_strength_min }) => {
+  async ({ days }) => {
     const result = await query(
       `SELECT id, display_name, company, title, last_seen_at, relationship_strength, interaction_count
          FROM person
         WHERE workspace_id = $1
           AND interaction_count > 0
           AND (last_seen_at IS NULL OR last_seen_at < now() - ($2 || ' days')::interval)
-          AND relationship_strength >= $3
-        ORDER BY relationship_strength DESC, last_seen_at ASC NULLS FIRST
+        -- Primary order stays staleness-first (most overdue first, MIN-1511);
+        -- relationship_strength (MIN-1169) is a trailing tiebreaker only, so
+        -- among equally-stale/equally-frequent people the ones who were
+        -- relatively more engaged before going quiet surface first.
+        ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC, relationship_strength DESC
         LIMIT 50`,
-      [WORKSPACE_ID, days, relationship_strength_min],
+      [WORKSPACE_ID, days],
     );
     return ok({ days, people: result.rows });
   },
@@ -420,6 +445,71 @@ server.tool(
       return { isError: true, content: [{ type: 'text', text: 'person_not_found' }] };
     }
     return ok({ person });
+  },
+);
+
+// ------- merge_person -------
+// Delegates to the REST API's existing, reversible merge implementation
+// (packages/api/src/sync/merge.ts via POST /api/people/merge) rather than
+// reimplementing merge semantics here — see packages/mcp-server/src/api-client.ts
+// for why the MCP server can't import that module directly.
+server.tool(
+  'merge_person',
+  'Merge two person records that represent the same human. Moves every interaction, note, commitment, and topic from loser_id onto survivor_id, then soft-deletes (tombstones) loser_id as a redirect. Reversible via the merge history (see GET /api/people/merges), though no MCP tool exposes reversal yet. Returns the updated survivor.',
+  {
+    survivor_id: z.string().uuid().describe('Person to keep. All references from loser_id are moved onto this person.'),
+    loser_id: z.string().uuid().describe('Duplicate person to merge away. Ends up tombstoned (soft-deleted) as a redirect to survivor_id.'),
+  },
+  async ({ survivor_id, loser_id }) => {
+    if (survivor_id === loser_id) {
+      return { isError: true, content: [{ type: 'text', text: 'survivor_id and loser_id must be different people.' }] };
+    }
+
+    // Read-only existence guard: the merge endpoint itself moves references
+    // and tombstones loser_id unconditionally, without checking that either
+    // side currently exists (see moveReferences/tombstoneEntity in
+    // sync/merge.ts) — so a nonexistent or already-merged-away loser_id would
+    // otherwise succeed silently instead of raising a readable error here.
+    const existing = await query<{ id: string }>(
+      `SELECT p.id FROM person p
+        WHERE p.workspace_id = $1 AND p.id = ANY($2::uuid[])
+          AND NOT EXISTS (
+            SELECT 1 FROM entity_tombstone et
+             WHERE et.workspace_id = p.workspace_id AND et.entity_type = 'person' AND et.entity_id = p.id
+          )`,
+      [WORKSPACE_ID, [survivor_id, loser_id]],
+    );
+    const found = new Set(existing.rows.map(r => r.id));
+    if (!found.has(survivor_id)) {
+      return { isError: true, content: [{ type: 'text', text: `survivor_id not found: ${survivor_id} (missing, or already tombstoned/merged away).` }] };
+    }
+    if (!found.has(loser_id)) {
+      return { isError: true, content: [{ type: 'text', text: `loser_id not found: ${loser_id} (missing, or already tombstoned/merged away).` }] };
+    }
+
+    await mergePeopleViaApi(survivor_id, loser_id);
+
+    const survivorRes = await query(`SELECT * FROM person WHERE workspace_id = $1 AND id = $2`, [WORKSPACE_ID, survivor_id]);
+    return ok({ survivor: survivorRes.rows[0] });
+  },
+);
+
+// ------- delete_person -------
+// Delegates to the REST API's existing soft-delete (packages/api/src/sync/tombstone.ts
+// via DELETE /api/people/:id) — see api-client.ts for why the MCP server can't
+// tombstone directly.
+server.tool(
+  'delete_person',
+  'Delete a person from the user\'s relationship memory. This is a soft delete (tombstone): the record stops appearing in search_people and other reads, but is not physically removed. Use merge_person instead if this is a duplicate you want to consolidate rather than remove outright.',
+  {
+    person_id: z.string().uuid(),
+  },
+  async ({ person_id }) => {
+    const { deleted } = await deletePersonViaApi(person_id);
+    if (!deleted) {
+      return { isError: true, content: [{ type: 'text', text: `person_not_found: ${person_id} (missing, or already deleted).` }] };
+    }
+    return ok({ deleted: true, person_id });
   },
 );
 
@@ -522,13 +612,100 @@ server.tool(
   },
 );
 
+// ------- list_companies -------
+// Documented, curated denylist for exclude_non_employers (default true) — matched
+// exact against lower(trim(company)). Kept intentionally narrow and literal:
+// non-company placeholder values plus staffing/recruiting agencies identified by
+// inspecting the live data (MIN-1507 prep). Brand/parent aliasing (e.g. "Meta" vs
+// "Facebook") is NOT guessed at here — that needs a human and is left to the
+// consumer of this tool.
+const NON_EMPLOYER_DENYLIST = [
+  // placeholder / non-employer values (not real companies)
+  'self-employed', 'self employed',
+  'freelance', 'freelancer',
+  'independent', 'independent consultant', 'independent contractor',
+  'stealth', 'stealth startup', 'stealth mode startup', 'stealth ai startup',
+  // staffing / recruiting agencies identified in the data
+  'teksystems', 'randstad enterprise', 'wollborg michelson recruiting',
+  "here's waldo recruiting", 'here’s waldo recruiting', // both apostrophe variants appear in source data
+];
+
+server.tool(
+  'list_companies',
+  'List distinct employers represented in the user\'s network (grouped case-insensitively on company name), with the people at each. Enumeration tool for reasoning over the network as a whole — pair with search_people once you know a specific target.',
+  {
+    min_contacts: z.number().int().min(1).default(1).describe('Only return companies with at least this many contacts.'),
+    query: z.string().optional().describe('Optional case-insensitive substring filter on company name.'),
+    limit: z.number().int().min(1).max(250).default(50),
+    exclude_non_employers: z.boolean().default(true).describe('Filter a documented denylist of placeholder values (Self-employed, Freelance, Independent, Stealth) and identified staffing agencies. Pass false to see the raw tail.'),
+  },
+  async ({ min_contacts, query: companyQuery, limit, exclude_non_employers }) => {
+    const params: unknown[] = [WORKSPACE_ID];
+    let where = `p.workspace_id = $1 AND p.company IS NOT NULL AND trim(p.company) <> ''`;
+    if (companyQuery) {
+      params.push(companyQuery.toLowerCase());
+      where += ` AND lower(trim(p.company)) LIKE '%' || $${params.length} || '%'`;
+    }
+    if (exclude_non_employers) {
+      params.push(NON_EMPLOYER_DENYLIST);
+      where += ` AND NOT (lower(trim(p.company)) = ANY($${params.length}::text[]))`;
+    }
+    params.push(min_contacts);
+    const minContactsIdx = params.length;
+    params.push(limit);
+    const limitIdx = params.length;
+
+    const result = await query(
+      `WITH matched AS (
+         SELECT p.id, p.display_name, p.last_seen_at,
+                lower(trim(p.company)) AS company_key,
+                trim(p.company) AS company_display,
+                -- position: person.title (MIN-1512 backfilled) wins; fall back to
+                -- the "Position: ..." line the LinkedIn import leaves in summary
+                -- (same pattern as packages/api/src/backfill-title-from-summary.ts);
+                -- null when neither is present.
+                NULLIF(trim(coalesce(p.title, substring(p.summary from 'Position:[ \t]*([^\n]*)'))), '') AS position
+           FROM person p
+          WHERE ${where}
+       ),
+       grouped AS (
+         SELECT company_key,
+                mode() WITHIN GROUP (ORDER BY company_display) AS company,
+                count(*) AS contact_count,
+                json_agg(
+                  json_build_object('id', id, 'display_name', display_name, 'position', position, 'last_seen_at', last_seen_at)
+                  ORDER BY last_seen_at DESC NULLS LAST, display_name ASC
+                ) AS people
+           FROM matched
+          GROUP BY company_key
+         HAVING count(*) >= $${minContactsIdx}
+       )
+       SELECT company, contact_count, people, count(*) OVER () AS total_companies
+         FROM grouped
+        ORDER BY contact_count DESC, company ASC
+        LIMIT $${limitIdx}`,
+      params,
+    );
+
+    const total_companies = result.rows.length ? Number(result.rows[0]!.total_companies) : 0;
+    return ok({
+      companies: result.rows.map(r => ({
+        company: r.company,
+        contact_count: Number(r.contact_count),
+        people: r.people,
+      })),
+      total_companies,
+    });
+  },
+);
+
 // ------- research_person -------
 // PREP step: resolves the target, returns context the agent needs to synthesize.
 // The agent (Claude) uses its own WebFetch on linkedin_url + any public sources,
 // or asks the user to paste profile text, then calls save_person_research.
 server.tool(
   'research_person',
-  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research.',
+  'Prepare to research a person. Resolves them by linkedin_url, person_id, or name; returns their current record (summary, topics, recent interactions, prior research notes), the user\'s configured interest areas for overlap detection, and instructions for the agent. Does NOT fetch the LinkedIn URL itself — the calling agent should WebFetch it (or ask the user to paste profile text), synthesize a 2-3 paragraph synopsis with topics and overlap, then call save_person_research. The response\'s relationship_strength is a computed 0-1 recency x frequency score over past interactions (0 for no interaction history).',
   {
     linkedin_url: z.string().url().optional().describe('LinkedIn profile URL — preferred way to identify someone.'),
     person_id: z.string().uuid().optional(),
@@ -557,7 +734,10 @@ server.tool(
         `SELECT * FROM person WHERE workspace_id = $1
            AND (lower(display_name) = lower($2)
                 OR display_name ILIKE '%' || $2 || '%')
-         ORDER BY relationship_strength DESC LIMIT 1`,
+         -- relationship_strength is now computed (MIN-1169) — prefer the
+         -- strongest match among multiple same-name hits, falling back to
+         -- most-interacted / most-recently-seen (MIN-1511) as tiebreakers.
+         ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
         [WORKSPACE_ID, name],
       );
       person = r.rows[0] ?? null;

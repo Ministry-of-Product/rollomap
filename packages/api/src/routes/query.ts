@@ -9,9 +9,12 @@ queryRouter.post('/people-for-idea', async (req, res) => {
   const Body = z.object({
     idea: z.string().min(1),
     limit: z.number().int().min(1).max(50).optional(),
-    relationship_strength_min: z.number().min(0).max(1).optional(),
+    // relationship_strength_min stays removed (MIN-1511 / MIN-1169): even now
+    // that the column is computed, a hard threshold would silently exclude
+    // the ~57% of people with no interaction history. Do not reintroduce a
+    // filter/threshold on relationship_strength.
   });
-  const { idea, limit = 10, relationship_strength_min = 0 } = Body.parse(req.body);
+  const { idea, limit = 10 } = Body.parse(req.body);
 
   const tsQuery = idea
     .split(/\s+/)
@@ -67,6 +70,13 @@ queryRouter.post('/people-for-idea', async (req, res) => {
             coalesce(pts.matched_topics, '[]'::json) AS matched_topics,
             coalesce(pis.top_interactions, '[]'::json) AS evidence_interactions,
             (
+              -- relationship_strength restored (MIN-1169: it's now actually
+              -- computed — recency x frequency decay over interactions).
+              -- Weight of 15 matches the term's original pre-MIN-1511 weight:
+              -- an idea is more actionable through someone you have an
+              -- established, live relationship with, but topic/interaction
+              -- text-match evidence (30+20=50) still dominates the score so a
+              -- strong relationship can't outrank an actual subject-matter fit.
               30 * least(coalesce(pts.topic_score, 0), 1.0) +
               20 * least(coalesce(pis.interaction_score, 0), 1.0) +
               15 * coalesce(p.relationship_strength, 0) +
@@ -78,11 +88,10 @@ queryRouter.post('/people-for-idea', async (req, res) => {
        LEFT JOIN person_interaction_score pis ON pis.person_id = p.id
        LEFT JOIN summary_score ss ON ss.person_id = p.id
       WHERE p.workspace_id = $1
-        AND p.relationship_strength >= $3
         AND (pts.topic_score IS NOT NULL OR pis.interaction_score IS NOT NULL OR ss.summary_rank IS NOT NULL)
       ORDER BY score DESC
-      LIMIT $4`,
-    [WORKSPACE_ID, tsQuery, relationship_strength_min, limit],
+      LIMIT $3`,
+    [WORKSPACE_ID, tsQuery, limit],
   );
 
   res.json({
@@ -133,7 +142,10 @@ queryRouter.post('/person-briefing', async (req, res) => {
     : await query(
         `SELECT * FROM person WHERE workspace_id = $1
            AND (lower(display_name) = lower($2) OR lower(primary_email) = lower($2))
-         ORDER BY relationship_strength DESC LIMIT 1`,
+         -- relationship_strength is now computed (MIN-1169) — prefer the
+         -- strongest match among multiple same-name hits, falling back to
+         -- most-interacted / most-recently-seen (MIN-1511) as tiebreakers.
+         ORDER BY relationship_strength DESC, interaction_count DESC, last_seen_at DESC NULLS LAST LIMIT 1`,
         [WORKSPACE_ID, body.name],
       );
   if (personRow.rowCount === 0) return res.status(404).json({ error: 'not_found' });
@@ -226,14 +238,21 @@ queryRouter.post('/search', async (req, res) => {
 // Neglected relationships
 queryRouter.get('/neglected', async (req, res) => {
   const days = Number((req.query.days as string) || 90);
+  // The relationship_strength >= 0.3 filter that used to live here stays
+  // removed (MIN-1511) even now that the column is computed (MIN-1169):
+  // "neglected" is defined by staleness, and a min-strength threshold would
+  // still risk silently dropping people. Ordering stays primarily by
+  // staleness (most overdue first); relationship_strength is added as a
+  // trailing tiebreaker so, among equally-stale/equally-frequent people, the
+  // ones who were relatively more engaged before going quiet surface first —
+  // it's a tiebreaker, not a filter.
   const result = await query(
     `SELECT id, display_name, company, title, last_seen_at, relationship_strength, interaction_count
        FROM person
       WHERE workspace_id = $1
         AND interaction_count > 0
         AND (last_seen_at IS NULL OR last_seen_at < now() - ($2 || ' days')::interval)
-        AND relationship_strength >= 0.3
-      ORDER BY relationship_strength DESC, last_seen_at ASC NULLS FIRST
+      ORDER BY last_seen_at ASC NULLS FIRST, interaction_count DESC, relationship_strength DESC
       LIMIT 50`,
     [WORKSPACE_ID, days],
   );

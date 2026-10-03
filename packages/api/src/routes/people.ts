@@ -56,7 +56,12 @@ peopleRouter.get('/', async (req, res) => {
                WHERE pt.person_id = p.id) AS topics
      FROM person p
      WHERE ${where}
-     ORDER BY p.user_pinned DESC, p.relationship_strength DESC, p.display_name ASC
+     -- relationship_strength is now computed (MIN-1169: recency x frequency
+     -- decay over interactions; see score-relationship-strength.ts) and is
+     -- restored as the primary ranking key, with the MIN-1511 tiebreakers
+     -- kept underneath — they're what keep the ~57% of people who've never
+     -- had an interaction (score 0) ordered sensibly instead of arbitrarily.
+     ORDER BY p.user_pinned DESC, p.relationship_strength DESC, p.interaction_count DESC, p.last_seen_at DESC NULLS LAST, p.display_name ASC
      LIMIT $${params.length}`,
     params,
   );
